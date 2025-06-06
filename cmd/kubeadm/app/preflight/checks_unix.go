@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -21,7 +22,7 @@ package preflight
 import (
 	"os"
 
-	"github.com/pkg/errors"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 // Check validates if an user has elevated (root) privileges.

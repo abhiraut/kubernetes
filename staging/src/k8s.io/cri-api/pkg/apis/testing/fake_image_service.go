@@ -17,14 +17,16 @@ limitations under the License.
 package testing
 
 import (
+	"context"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
+// FakeImageService fakes the image service.
 type FakeImageService struct {
 	sync.Mutex
 
@@ -32,22 +34,40 @@ type FakeImageService struct {
 	Called        []string
 	Errors        map[string][]error
 	Images        map[string]*runtimeapi.Image
+	Pinned        map[string]bool
 
 	pulledImages []*pulledImage
 
-	FakeFilesystemUsage []*runtimeapi.FilesystemUsage
+	FakeFilesystemUsage          []*runtimeapi.FilesystemUsage
+	FakeContainerFilesystemUsage []*runtimeapi.FilesystemUsage
 }
 
+// SetFakeImages sets the list of fake images for the FakeImageService.
 func (r *FakeImageService) SetFakeImages(images []string) {
 	r.Lock()
 	defer r.Unlock()
 
 	r.Images = make(map[string]*runtimeapi.Image)
 	for _, image := range images {
-		r.Images[image] = r.makeFakeImage(image)
+		r.Images[image] = r.makeFakeImage(
+			&runtimeapi.ImageSpec{
+				Image:       image,
+				Annotations: make(map[string]string)})
 	}
 }
 
+// SetFakeImagesWithAnnotations sets the list of fake images for the FakeImageService with annotations.
+func (r *FakeImageService) SetFakeImagesWithAnnotations(imageSpecs []*runtimeapi.ImageSpec) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.Images = make(map[string]*runtimeapi.Image)
+	for _, imageSpec := range imageSpecs {
+		r.Images[imageSpec.Image] = r.makeFakeImage(imageSpec)
+	}
+}
+
+// SetFakeImageSize sets the image size for the FakeImageService.
 func (r *FakeImageService) SetFakeImageSize(size uint64) {
 	r.Lock()
 	defer r.Unlock()
@@ -55,6 +75,18 @@ func (r *FakeImageService) SetFakeImageSize(size uint64) {
 	r.FakeImageSize = size
 }
 
+// SetFakeImagePinned sets the image Pinned field for one image.
+func (r *FakeImageService) SetFakeImagePinned(image string, pinned bool) {
+	r.Lock()
+	defer r.Unlock()
+
+	if r.Pinned == nil {
+		r.Pinned = make(map[string]bool)
+	}
+	r.Pinned[image] = pinned
+}
+
+// SetFakeFilesystemUsage sets the FilesystemUsage for FakeImageService.
 func (r *FakeImageService) SetFakeFilesystemUsage(usage []*runtimeapi.FilesystemUsage) {
 	r.Lock()
 	defer r.Unlock()
@@ -62,6 +94,15 @@ func (r *FakeImageService) SetFakeFilesystemUsage(usage []*runtimeapi.Filesystem
 	r.FakeFilesystemUsage = usage
 }
 
+// SetFakeFilesystemUsage sets the FilesystemUsage for FakeImageService.
+func (r *FakeImageService) SetFakeContainerFilesystemUsage(usage []*runtimeapi.FilesystemUsage) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.FakeContainerFilesystemUsage = usage
+}
+
+// NewFakeImageService creates a new FakeImageService.
 func NewFakeImageService() *FakeImageService {
 	return &FakeImageService{
 		Called: make([]string, 0),
@@ -70,11 +111,13 @@ func NewFakeImageService() *FakeImageService {
 	}
 }
 
-func (r *FakeImageService) makeFakeImage(image string) *runtimeapi.Image {
+func (r *FakeImageService) makeFakeImage(image *runtimeapi.ImageSpec) *runtimeapi.Image {
 	return &runtimeapi.Image{
-		Id:       image,
+		Id:       image.Image,
 		Size_:    r.FakeImageSize,
-		RepoTags: []string{image},
+		Spec:     image,
+		RepoTags: []string{image.Image},
+		Pinned:   r.Pinned[image.Image],
 	}
 }
 
@@ -89,6 +132,7 @@ func stringInSlice(s string, list []string) bool {
 	return false
 }
 
+// InjectError sets the error message for the FakeImageService.
 func (r *FakeImageService) InjectError(f string, err error) {
 	r.Lock()
 	defer r.Unlock()
@@ -109,7 +153,8 @@ func (r *FakeImageService) popError(f string) error {
 	return err
 }
 
-func (r *FakeImageService) ListImages(filter *runtimeapi.ImageFilter) ([]*runtimeapi.Image, error) {
+// ListImages returns the list of images from FakeImageService or error if it was previously set.
+func (r *FakeImageService) ListImages(_ context.Context, filter *runtimeapi.ImageFilter) ([]*runtimeapi.Image, error) {
 	r.Lock()
 	defer r.Unlock()
 
@@ -131,7 +176,8 @@ func (r *FakeImageService) ListImages(filter *runtimeapi.ImageFilter) ([]*runtim
 	return images, nil
 }
 
-func (r *FakeImageService) ImageStatus(image *runtimeapi.ImageSpec) (*runtimeapi.Image, error) {
+// ImageStatus returns the status of the image from the FakeImageService.
+func (r *FakeImageService) ImageStatus(_ context.Context, image *runtimeapi.ImageSpec, verbose bool) (*runtimeapi.ImageStatusResponse, error) {
 	r.Lock()
 	defer r.Unlock()
 
@@ -140,10 +186,11 @@ func (r *FakeImageService) ImageStatus(image *runtimeapi.ImageSpec) (*runtimeapi
 		return nil, err
 	}
 
-	return r.Images[image.Image], nil
+	return &runtimeapi.ImageStatusResponse{Image: r.Images[image.Image]}, nil
 }
 
-func (r *FakeImageService) PullImage(image *runtimeapi.ImageSpec, auth *runtimeapi.AuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, error) {
+// PullImage emulate pulling the image from the FakeImageService.
+func (r *FakeImageService) PullImage(_ context.Context, image *runtimeapi.ImageSpec, auth *runtimeapi.AuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, error) {
 	r.Lock()
 	defer r.Unlock()
 
@@ -157,13 +204,14 @@ func (r *FakeImageService) PullImage(image *runtimeapi.ImageSpec, auth *runtimea
 	// image's name for easily making fake images.
 	imageID := image.Image
 	if _, ok := r.Images[imageID]; !ok {
-		r.Images[imageID] = r.makeFakeImage(image.Image)
+		r.Images[imageID] = r.makeFakeImage(image)
 	}
 
 	return imageID, nil
 }
 
-func (r *FakeImageService) RemoveImage(image *runtimeapi.ImageSpec) error {
+// RemoveImage removes image from the FakeImageService.
+func (r *FakeImageService) RemoveImage(_ context.Context, image *runtimeapi.ImageSpec) error {
 	r.Lock()
 	defer r.Unlock()
 
@@ -179,7 +227,7 @@ func (r *FakeImageService) RemoveImage(image *runtimeapi.ImageSpec) error {
 }
 
 // ImageFsInfo returns information of the filesystem that is used to store images.
-func (r *FakeImageService) ImageFsInfo() ([]*runtimeapi.FilesystemUsage, error) {
+func (r *FakeImageService) ImageFsInfo(_ context.Context) (*runtimeapi.ImageFsInfoResponse, error) {
 	r.Lock()
 	defer r.Unlock()
 
@@ -188,9 +236,13 @@ func (r *FakeImageService) ImageFsInfo() ([]*runtimeapi.FilesystemUsage, error) 
 		return nil, err
 	}
 
-	return r.FakeFilesystemUsage, nil
+	return &runtimeapi.ImageFsInfoResponse{
+		ImageFilesystems:     r.FakeFilesystemUsage,
+		ContainerFilesystems: r.FakeContainerFilesystemUsage,
+	}, nil
 }
 
+// AssertImagePulledWithAuth validates whether the image was pulled with auth and asserts if it wasn't.
 func (r *FakeImageService) AssertImagePulledWithAuth(t *testing.T, image *runtimeapi.ImageSpec, auth *runtimeapi.AuthConfig, failMsg string) {
 	r.Lock()
 	defer r.Unlock()

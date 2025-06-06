@@ -18,7 +18,7 @@ package top
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -30,11 +30,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/rest/fake"
 	core "k8s.io/client-go/testing"
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
-	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
 	metricsv1alpha1api "k8s.io/metrics/pkg/apis/metrics/v1alpha1"
 	metricsv1beta1api "k8s.io/metrics/pkg/apis/metrics/v1beta1"
@@ -80,15 +79,16 @@ const (
 func TestTopPod(t *testing.T) {
 	testNS := "testns"
 	testCases := []struct {
-		name            string
-		namespace       string
-		options         *TopPodOptions
-		args            []string
-		expectedQuery   string
-		expectedPods    []string
-		namespaces      []string
-		containers      bool
-		listsNamespaces bool
+		name               string
+		namespace          string
+		options            *TopPodOptions
+		args               []string
+		expectedQuery      string
+		expectedPods       []string
+		expectedContainers []string
+		namespaces         []string
+		containers         bool
+		listsNamespaces    bool
 	}{
 		{
 			name:            "all namespaces",
@@ -107,28 +107,72 @@ func TestTopPod(t *testing.T) {
 		},
 		{
 			name:          "pod with label selector",
-			options:       &TopPodOptions{Selector: "key=value"},
+			options:       &TopPodOptions{LabelSelector: "key=value"},
 			expectedQuery: "labelSelector=" + url.QueryEscape("key=value"),
 			namespaces:    []string{testNS, testNS},
 		},
 		{
-			name:       "pod with container metrics",
-			options:    &TopPodOptions{PrintContainers: true},
-			args:       []string{"pod1"},
+			name:          "pod with field selector",
+			options:       &TopPodOptions{FieldSelector: "key=value"},
+			expectedQuery: "fieldSelector=" + url.QueryEscape("key=value"),
+			namespaces:    []string{testNS, testNS},
+		},
+		{
+			name:    "pod with container metrics",
+			options: &TopPodOptions{PrintContainers: true},
+			args:    []string{"pod1"},
+			expectedContainers: []string{
+				"container1-1",
+				"container1-2",
+			},
 			namespaces: []string{testNS},
 			containers: true,
 		},
 		{
-			name:         "pod with label sort by cpu",
+			name:         "pod sort by cpu",
 			options:      &TopPodOptions{SortBy: "cpu"},
 			expectedPods: []string{"pod2", "pod3", "pod1"},
 			namespaces:   []string{testNS, testNS, testNS},
 		},
 		{
-			name:         "pod with label sort by memory",
+			name:         "pod sort by memory",
 			options:      &TopPodOptions{SortBy: "memory"},
 			expectedPods: []string{"pod2", "pod3", "pod1"},
 			namespaces:   []string{testNS, testNS, testNS},
+		},
+		{
+			name:    "container sort by cpu",
+			options: &TopPodOptions{PrintContainers: true, SortBy: "cpu"},
+			expectedContainers: []string{
+				"container2-3",
+				"container2-2",
+				"container2-1",
+				"container3-1",
+				"container1-2",
+				"container1-1",
+			},
+			namespaces: []string{testNS, testNS, testNS},
+			containers: true,
+		},
+		{
+			name:    "container sort by memory",
+			options: &TopPodOptions{PrintContainers: true, SortBy: "memory"},
+			expectedContainers: []string{
+				"container2-3",
+				"container2-2",
+				"container2-1",
+				"container3-1",
+				"container1-2",
+				"container1-1",
+			},
+			namespaces: []string{testNS, testNS, testNS},
+			containers: true,
+		},
+		{
+			name:            "with swap",
+			options:         &TopPodOptions{AllNamespaces: true, ShowSwap: true},
+			namespaces:      []string{testNS, "secondtestns", "thirdtestns"},
+			listsNamespaces: true,
 		},
 	}
 	cmdtesting.InitTestErrorHandler(t)
@@ -177,9 +221,9 @@ func TestTopPod(t *testing.T) {
 				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 					switch p := req.URL.Path; {
 					case p == "/api":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
 					case p == "/apis":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
 					default:
 						t.Fatalf("%s: unexpected request: %#v\nGot URL: %#v",
 							testCase.name, req, req.URL)
@@ -188,7 +232,7 @@ func TestTopPod(t *testing.T) {
 				}),
 			}
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-			streams, _, buf, _ := genericclioptions.NewTestIOStreams()
+			streams, _, buf, _ := genericiooptions.NewTestIOStreams()
 
 			cmd := NewCmdTopPod(tf, nil, streams)
 			var cmdOptions *TopPodOptions
@@ -234,21 +278,123 @@ func TestTopPod(t *testing.T) {
 					t.Errorf("unexpected metrics for %s: \n%s", name, result)
 				}
 			}
-			if cmdutil.GetFlagString(cmd, "sort-by") == "cpu" || cmdutil.GetFlagString(cmd, "sort-by") == "memory" {
-				resultLines := strings.Split(result, "\n")
-				resultPods := make([]string, len(resultLines)-2) // don't process first (header) and last (empty) line
-
-				for i, line := range resultLines[1 : len(resultLines)-1] { // don't process first (header) and last (empty) line
-					lineFirstColumn := strings.Split(line, " ")[0]
-					resultPods[i] = lineFirstColumn
-				}
-
+			if testCase.expectedPods != nil {
+				resultPods := getResultColumnValues(result, 0)
 				if !reflect.DeepEqual(testCase.expectedPods, resultPods) {
-					t.Errorf("kinds not matching:\n\texpectedKinds: %v\n\tgotKinds: %v\n", testCase.expectedPods, resultPods)
+					t.Errorf("pods not matching:\n\texpectedPods: %v\n\tresultPods: %v\n", testCase.expectedPods, resultPods)
+				}
+			}
+			if testCase.expectedContainers != nil {
+				resultContainers := getResultColumnValues(result, 1)
+				if !reflect.DeepEqual(testCase.expectedContainers, resultContainers) {
+					t.Errorf("containers not matching:\n\texpectedContainers: %v\n\tresultContainers: %v\n", testCase.expectedContainers, resultContainers)
+				}
+			}
+			if testCase.options != nil && testCase.options.ShowSwap {
+				if !strings.Contains(result, "SWAP(bytes)") {
+					t.Errorf("missing SWAP(bytes) header: \n%s", result)
 				}
 			}
 		})
 	}
+}
+
+func TestTopPodWithSwap(t *testing.T) {
+	cmdtesting.InitTestErrorHandler(t)
+
+	const testName = "TestTopPodWithSwap"
+	t.Run(testName, func(t *testing.T) {
+		metricsList := testV1beta1PodMetricsData()
+		fakemetricsClientset := &metricsfake.Clientset{}
+
+		fakemetricsClientset.AddReactor("list", "pods", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+			res := &metricsv1beta1api.PodMetricsList{
+				Items: metricsList,
+			}
+			return true, res, nil
+		})
+
+		tf := cmdtesting.NewTestFactory()
+		defer tf.Cleanup()
+
+		ns := scheme.Codecs.WithoutConversion()
+
+		tf.Client = &fake.RESTClient{
+			NegotiatedSerializer: ns,
+			Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/api":
+					return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
+				case "/apis":
+					return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
+				default:
+					t.Fatalf("%s: unexpected request: %#v\nGot URL: %#v",
+						testName, req, req.URL)
+					return nil, nil
+				}
+			}),
+		}
+		streams, _, buf, _ := genericiooptions.NewTestIOStreams()
+
+		cmd := NewCmdTopPod(tf, nil, streams)
+		cmdOptions := &TopPodOptions{
+			ShowSwap: true,
+		}
+		cmdOptions.IOStreams = streams
+
+		if err := cmdOptions.Complete(tf, cmd, nil); err != nil {
+			t.Fatal(err)
+		}
+		cmdOptions.MetricsClient = fakemetricsClientset
+		if err := cmdOptions.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmdOptions.RunTopPod(); err != nil {
+			t.Fatal(err)
+		}
+
+		result := buf.String()
+
+		expectedSwapBytes := map[string]string{
+			"pod1": "4Mi",
+			"pod2": "0Mi",
+			"pod3": "3Mi",
+		}
+
+		actualSwapBytes := map[string]string{}
+		for _, line := range strings.Split(result, "\n")[1:] {
+			lineFields := strings.Fields(line)
+			if len(lineFields) < 4 {
+				continue
+			}
+
+			podName := lineFields[0]
+			swapBytes := lineFields[3]
+			actualSwapBytes[podName] = swapBytes
+		}
+
+		for expectedPodName, expectedSwapBytes := range expectedSwapBytes {
+			actualSwapBytes, found := actualSwapBytes[expectedPodName]
+			if !found {
+				t.Errorf("missing swap metrics for pod %s", expectedPodName)
+			}
+			if actualSwapBytes != expectedSwapBytes {
+				t.Errorf("unexpected swap metrics for pod %s: expected %s, got %s", expectedPodName, expectedSwapBytes, actualSwapBytes)
+			}
+		}
+	})
+}
+
+func getResultColumnValues(result string, columnIndex int) []string {
+	resultLines := strings.Split(result, "\n")
+	values := make([]string, len(resultLines)-2) // don't process first (header) and last (empty) line
+
+	for i, line := range resultLines[1 : len(resultLines)-1] { // don't process first (header) and last (empty) line
+		value := strings.Fields(line)[columnIndex]
+		values[i] = value
+	}
+
+	return values
 }
 
 func TestTopPodNoResourcesFound(t *testing.T) {
@@ -297,9 +443,9 @@ func TestTopPodNoResourcesFound(t *testing.T) {
 				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 					switch p := req.URL.Path; {
 					case p == "/api":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
 					case p == "/apis":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
 					case p == "/api/v1/namespaces/"+testNS+"/pods":
 						// Top Pod calls this endpoint to check if there are pods whenever it gets no metrics,
 						// so we need to return no pods for this test scenario
@@ -318,7 +464,7 @@ func TestTopPodNoResourcesFound(t *testing.T) {
 				}),
 			}
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-			streams, _, buf, errbuf := genericclioptions.NewTestIOStreams()
+			streams, _, buf, errbuf := genericiooptions.NewTestIOStreams()
 
 			cmd := NewCmdTopPod(tf, nil, streams)
 			var cmdOptions *TopPodOptions
@@ -361,6 +507,7 @@ func testV1beta1PodMetricsData() []metricsv1beta1api.PodMetrics {
 					Usage: v1.ResourceList{
 						v1.ResourceCPU:     *resource.NewMilliQuantity(1, resource.DecimalSI),
 						v1.ResourceMemory:  *resource.NewQuantity(2*(1024*1024), resource.DecimalSI),
+						"swap":             *resource.NewQuantity(1*(1024*1024), resource.DecimalSI),
 						v1.ResourceStorage: *resource.NewQuantity(3*(1024*1024), resource.DecimalSI),
 					},
 				},
@@ -369,6 +516,7 @@ func testV1beta1PodMetricsData() []metricsv1beta1api.PodMetrics {
 					Usage: v1.ResourceList{
 						v1.ResourceCPU:     *resource.NewMilliQuantity(4, resource.DecimalSI),
 						v1.ResourceMemory:  *resource.NewQuantity(5*(1024*1024), resource.DecimalSI),
+						"swap":             *resource.NewQuantity(3*(1024*1024), resource.DecimalSI),
 						v1.ResourceStorage: *resource.NewQuantity(6*(1024*1024), resource.DecimalSI),
 					},
 				},
@@ -413,6 +561,7 @@ func testV1beta1PodMetricsData() []metricsv1beta1api.PodMetrics {
 					Usage: v1.ResourceList{
 						v1.ResourceCPU:     *resource.NewMilliQuantity(7, resource.DecimalSI),
 						v1.ResourceMemory:  *resource.NewQuantity(8*(1024*1024), resource.DecimalSI),
+						"swap":             *resource.NewQuantity(3*(1024*1024), resource.DecimalSI),
 						v1.ResourceStorage: *resource.NewQuantity(9*(1024*1024), resource.DecimalSI),
 					},
 				},

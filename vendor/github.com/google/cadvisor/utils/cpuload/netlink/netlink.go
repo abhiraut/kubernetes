@@ -21,12 +21,14 @@ import (
 	"os"
 	"syscall"
 
-	info "github.com/google/cadvisor/info/v1"
 	"golang.org/x/sys/unix"
+
+	info "github.com/google/cadvisor/info/v1"
 )
 
 var (
 	// TODO(rjnagal): Verify and fix for other architectures.
+
 	Endian = binary.LittleEndian
 )
 
@@ -42,11 +44,11 @@ type netlinkMessage struct {
 	Data      []byte
 }
 
-func (self netlinkMessage) toRawMsg() (rawmsg syscall.NetlinkMessage) {
-	rawmsg.Header = self.Header
+func (m netlinkMessage) toRawMsg() (rawmsg syscall.NetlinkMessage) {
+	rawmsg.Header = m.Header
 	w := bytes.NewBuffer([]byte{})
-	binary.Write(w, Endian, self.GenHeader)
-	w.Write(self.Data)
+	_ = binary.Write(w, Endian, m.GenHeader)
+	w.Write(m.Data)
 	rawmsg.Data = w.Bytes()
 	return rawmsg
 }
@@ -64,9 +66,12 @@ func padding(size int, alignment int) int {
 }
 
 // Get family id for taskstats subsystem.
-func getFamilyId(conn *Connection) (uint16, error) {
+func getFamilyID(conn *Connection) (uint16, error) {
 	msg := prepareFamilyMessage()
-	conn.WriteMessage(msg.toRawMsg())
+	err := conn.WriteMessage(msg.toRawMsg())
+	if err != nil {
+		return 0, err
+	}
 
 	resp, err := conn.ReadMessage()
 	if err != nil {
@@ -89,13 +94,13 @@ func addAttribute(buf *bytes.Buffer, attrType uint16, data interface{}, dataSize
 		Type: attrType,
 	}
 	attr.Len += uint16(dataSize)
-	binary.Write(buf, Endian, attr)
+	_ = binary.Write(buf, Endian, attr)
 	switch data := data.(type) {
 	case string:
-		binary.Write(buf, Endian, []byte(data))
+		_ = binary.Write(buf, Endian, []byte(data))
 		buf.WriteByte(0) // terminate
 	default:
-		binary.Write(buf, Endian, data)
+		_ = binary.Write(buf, Endian, data)
 	}
 	for i := 0; i < padding(int(attr.Len), syscall.NLMSG_ALIGNTO); i++ {
 		buf.WriteByte(0)
@@ -164,7 +169,7 @@ func parseFamilyResp(msg syscall.NetlinkMessage) (uint16, error) {
 			return 0, err
 		}
 	}
-	return 0, fmt.Errorf("family id not found in the response.")
+	return 0, fmt.Errorf("family id not found in the response")
 }
 
 // Extract task stats from response returned by kernel.
@@ -203,7 +208,10 @@ func verifyHeader(msg syscall.NetlinkMessage) error {
 	case syscall.NLMSG_ERROR:
 		buf := bytes.NewBuffer(msg.Data)
 		var errno int32
-		binary.Read(buf, Endian, errno)
+		err := binary.Read(buf, Endian, errno)
+		if err != nil {
+			return err
+		}
 		return fmt.Errorf("netlink request failed with error %s", syscall.Errno(-errno))
 	}
 	return nil

@@ -20,10 +20,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
-	kubeschedulerconfigv1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1"
-	kubeschedulerconfigv1alpha1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1alpha1"
-	kubeschedulerconfigv1alpha2 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1alpha2"
+	config "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	configv1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1"
 )
 
 var (
@@ -40,9 +38,9 @@ func init() {
 
 // AddToScheme builds the kubescheduler scheme using all known versions of the kubescheduler api.
 func AddToScheme(scheme *runtime.Scheme) {
-	utilruntime.Must(kubeschedulerconfig.AddToScheme(scheme))
-	utilruntime.Must(kubeschedulerconfigv1.AddToScheme(scheme))
-	utilruntime.Must(kubeschedulerconfigv1alpha1.AddToScheme(scheme))
-	utilruntime.Must(kubeschedulerconfigv1alpha2.AddToScheme(scheme))
-	utilruntime.Must(scheme.SetVersionPriority(kubeschedulerconfigv1alpha2.SchemeGroupVersion, kubeschedulerconfigv1alpha1.SchemeGroupVersion))
+	utilruntime.Must(config.AddToScheme(scheme))
+	utilruntime.Must(configv1.AddToScheme(scheme))
+	utilruntime.Must(scheme.SetVersionPriority(
+		configv1.SchemeGroupVersion,
+	))
 }

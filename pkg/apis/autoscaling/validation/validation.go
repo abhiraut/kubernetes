@@ -18,16 +18,14 @@ package validation
 
 import (
 	"fmt"
-	"strings"
 
 	apimachineryvalidation "k8s.io/apimachinery/pkg/api/validation"
 	pathvalidation "k8s.io/apimachinery/pkg/api/validation/path"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
+	corevalidation "k8s.io/kubernetes/pkg/apis/core/v1/validation"
 	apivalidation "k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/kubernetes/pkg/features"
 )
 
 const (
@@ -43,7 +41,7 @@ func ValidateScale(scale *autoscaling.Scale) field.ErrorList {
 	allErrs = append(allErrs, apivalidation.ValidateObjectMeta(&scale.ObjectMeta, true, apimachineryvalidation.NameIsDNSSubdomain, field.NewPath("metadata"))...)
 
 	if scale.Spec.Replicas < 0 {
-		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "replicas"), scale.Spec.Replicas, "must be greater than or equal to 0"))
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(scale.Spec.Replicas), field.NewPath("spec", "replicas")).MarkCoveredByDeclarative()...)
 	}
 
 	return allErrs
@@ -53,12 +51,12 @@ func ValidateScale(scale *autoscaling.Scale) field.ErrorList {
 // Prefix indicates this name will be used as part of generation, in which case trailing dashes are allowed.
 var ValidateHorizontalPodAutoscalerName = apivalidation.ValidateReplicationControllerName
 
-func validateHorizontalPodAutoscalerSpec(autoscaler autoscaling.HorizontalPodAutoscalerSpec, fldPath *field.Path, minReplicasLowerBound int32) field.ErrorList {
+func validateHorizontalPodAutoscalerSpec(autoscaler autoscaling.HorizontalPodAutoscalerSpec, fldPath *field.Path, opts HorizontalPodAutoscalerSpecValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
 
-	if autoscaler.MinReplicas != nil && *autoscaler.MinReplicas < minReplicasLowerBound {
+	if autoscaler.MinReplicas != nil && *autoscaler.MinReplicas < opts.MinReplicasLowerBound {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("minReplicas"), *autoscaler.MinReplicas,
-			fmt.Sprintf("must be greater than or equal to %d", minReplicasLowerBound)))
+			fmt.Sprintf("must be greater than or equal to %d", opts.MinReplicasLowerBound)))
 	}
 	if autoscaler.MaxReplicas < 1 {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxReplicas"), autoscaler.MaxReplicas, "must be greater than 0"))
@@ -72,7 +70,7 @@ func validateHorizontalPodAutoscalerSpec(autoscaler autoscaling.HorizontalPodAut
 	if refErrs := validateMetrics(autoscaler.Metrics, fldPath.Child("metrics"), autoscaler.MinReplicas); len(refErrs) > 0 {
 		allErrs = append(allErrs, refErrs...)
 	}
-	if refErrs := validateBehavior(autoscaler.Behavior, fldPath.Child("behavior")); len(refErrs) > 0 {
+	if refErrs := validateBehavior(autoscaler.Behavior, fldPath.Child("behavior"), opts); len(refErrs) > 0 {
 		allErrs = append(allErrs, refErrs...)
 	}
 	return allErrs
@@ -103,38 +101,17 @@ func ValidateCrossVersionObjectReference(ref autoscaling.CrossVersionObjectRefer
 
 // ValidateHorizontalPodAutoscaler validates a HorizontalPodAutoscaler and returns an
 // ErrorList with any errors.
-func ValidateHorizontalPodAutoscaler(autoscaler *autoscaling.HorizontalPodAutoscaler) field.ErrorList {
+func ValidateHorizontalPodAutoscaler(autoscaler *autoscaling.HorizontalPodAutoscaler, opts HorizontalPodAutoscalerSpecValidationOptions) field.ErrorList {
 	allErrs := apivalidation.ValidateObjectMeta(&autoscaler.ObjectMeta, true, ValidateHorizontalPodAutoscalerName, field.NewPath("metadata"))
-
-	// MinReplicasLowerBound represents a minimum value for minReplicas
-	// 0 when HPA scale-to-zero feature is enabled
-	var minReplicasLowerBound int32
-
-	if utilfeature.DefaultFeatureGate.Enabled(features.HPAScaleToZero) {
-		minReplicasLowerBound = 0
-	} else {
-		minReplicasLowerBound = 1
-	}
-	allErrs = append(allErrs, validateHorizontalPodAutoscalerSpec(autoscaler.Spec, field.NewPath("spec"), minReplicasLowerBound)...)
+	allErrs = append(allErrs, validateHorizontalPodAutoscalerSpec(autoscaler.Spec, field.NewPath("spec"), opts)...)
 	return allErrs
 }
 
 // ValidateHorizontalPodAutoscalerUpdate validates an update to a HorizontalPodAutoscaler and returns an
 // ErrorList with any errors.
-func ValidateHorizontalPodAutoscalerUpdate(newAutoscaler, oldAutoscaler *autoscaling.HorizontalPodAutoscaler) field.ErrorList {
+func ValidateHorizontalPodAutoscalerUpdate(newAutoscaler, oldAutoscaler *autoscaling.HorizontalPodAutoscaler, opts HorizontalPodAutoscalerSpecValidationOptions) field.ErrorList {
 	allErrs := apivalidation.ValidateObjectMetaUpdate(&newAutoscaler.ObjectMeta, &oldAutoscaler.ObjectMeta, field.NewPath("metadata"))
-
-	// minReplicasLowerBound represents a minimum value for minReplicas
-	// 0 when HPA scale-to-zero feature is enabled or HPA object already has minReplicas=0
-	var minReplicasLowerBound int32
-
-	if utilfeature.DefaultFeatureGate.Enabled(features.HPAScaleToZero) || (oldAutoscaler.Spec.MinReplicas != nil && *oldAutoscaler.Spec.MinReplicas == 0) {
-		minReplicasLowerBound = 0
-	} else {
-		minReplicasLowerBound = 1
-	}
-
-	allErrs = append(allErrs, validateHorizontalPodAutoscalerSpec(newAutoscaler.Spec, field.NewPath("spec"), minReplicasLowerBound)...)
+	allErrs = append(allErrs, validateHorizontalPodAutoscalerSpec(newAutoscaler.Spec, field.NewPath("spec"), opts)...)
 	return allErrs
 }
 
@@ -146,6 +123,13 @@ func ValidateHorizontalPodAutoscalerStatusUpdate(newAutoscaler, oldAutoscaler *a
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.CurrentReplicas), field.NewPath("status", "currentReplicas"))...)
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.DesiredReplicas), field.NewPath("status", "desiredReplicas"))...)
 	return allErrs
+}
+
+// HorizontalPodAutoscalerSpecValidationOptions contains the different settings for
+// HorizontalPodAutoscaler spec validation.
+type HorizontalPodAutoscalerSpecValidationOptions struct {
+	// The minimum value for minReplicas.
+	MinReplicasLowerBound int32
 }
 
 func validateMetrics(metrics []autoscaling.MetricSpec, fldPath *field.Path, minReplicas *int32) field.ErrorList {
@@ -175,13 +159,13 @@ func validateMetrics(metrics []autoscaling.MetricSpec, fldPath *field.Path, minR
 	return allErrs
 }
 
-func validateBehavior(behavior *autoscaling.HorizontalPodAutoscalerBehavior, fldPath *field.Path) field.ErrorList {
+func validateBehavior(behavior *autoscaling.HorizontalPodAutoscalerBehavior, fldPath *field.Path, opts HorizontalPodAutoscalerSpecValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
 	if behavior != nil {
-		if scaleUpErrs := validateScalingRules(behavior.ScaleUp, fldPath.Child("scaleUp")); len(scaleUpErrs) > 0 {
+		if scaleUpErrs := validateScalingRules(behavior.ScaleUp, fldPath.Child("scaleUp"), opts); len(scaleUpErrs) > 0 {
 			allErrs = append(allErrs, scaleUpErrs...)
 		}
-		if scaleDownErrs := validateScalingRules(behavior.ScaleDown, fldPath.Child("scaleDown")); len(scaleDownErrs) > 0 {
+		if scaleDownErrs := validateScalingRules(behavior.ScaleDown, fldPath.Child("scaleDown"), opts); len(scaleDownErrs) > 0 {
 			allErrs = append(allErrs, scaleDownErrs...)
 		}
 	}
@@ -191,7 +175,7 @@ func validateBehavior(behavior *autoscaling.HorizontalPodAutoscalerBehavior, fld
 var validSelectPolicyTypes = sets.NewString(string(autoscaling.MaxPolicySelect), string(autoscaling.MinPolicySelect), string(autoscaling.DisabledPolicySelect))
 var validSelectPolicyTypesList = validSelectPolicyTypes.List()
 
-func validateScalingRules(rules *autoscaling.HPAScalingRules, fldPath *field.Path) field.ErrorList {
+func validateScalingRules(rules *autoscaling.HPAScalingRules, fldPath *field.Path, opts HorizontalPodAutoscalerSpecValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
 	if rules != nil {
 		if rules.StabilizationWindowSeconds != nil && *rules.StabilizationWindowSeconds < 0 {
@@ -213,6 +197,9 @@ func validateScalingRules(rules *autoscaling.HPAScalingRules, fldPath *field.Pat
 			if policyErrs := validateScalingPolicy(policy, idxPath); len(policyErrs) > 0 {
 				allErrs = append(allErrs, policyErrs...)
 			}
+		}
+		if rules.Tolerance != nil {
+			allErrs = append(allErrs, apivalidation.ValidateNonnegativeQuantity(*rules.Tolerance, fldPath.Child("tolerance"))...)
 		}
 	}
 	return allErrs
@@ -239,7 +226,10 @@ func validateScalingPolicy(policy autoscaling.HPAScalingPolicy, fldPath *field.P
 	return allErrs
 }
 
-var validMetricSourceTypes = sets.NewString(string(autoscaling.ObjectMetricSourceType), string(autoscaling.PodsMetricSourceType), string(autoscaling.ResourceMetricSourceType), string(autoscaling.ExternalMetricSourceType))
+var validMetricSourceTypes = sets.NewString(
+	string(autoscaling.ObjectMetricSourceType), string(autoscaling.PodsMetricSourceType),
+	string(autoscaling.ResourceMetricSourceType), string(autoscaling.ExternalMetricSourceType),
+	string(autoscaling.ContainerResourceMetricSourceType))
 var validMetricSourceTypesList = validMetricSourceTypes.List()
 
 func validateMetricSpec(spec autoscaling.MetricSpec, fldPath *field.Path) field.ErrorList {
@@ -282,10 +272,43 @@ func validateMetricSpec(spec autoscaling.MetricSpec, fldPath *field.Path) field.
 		}
 	}
 
-	expectedField := strings.ToLower(string(spec.Type))
+	if spec.ContainerResource != nil {
+		typesPresent.Insert("containerResource")
+		if typesPresent.Len() == 1 {
+			allErrs = append(allErrs, validateContainerResourceSource(spec.ContainerResource, fldPath.Child("containerResource"))...)
+		}
+	}
 
-	if !typesPresent.Has(expectedField) {
-		allErrs = append(allErrs, field.Required(fldPath.Child(expectedField), "must populate information for the given metric source"))
+	var expectedField string
+	switch spec.Type {
+
+	case autoscaling.ObjectMetricSourceType:
+		if spec.Object == nil {
+			allErrs = append(allErrs, field.Required(fldPath.Child("object"), "must populate information for the given metric source"))
+		}
+		expectedField = "object"
+	case autoscaling.PodsMetricSourceType:
+		if spec.Pods == nil {
+			allErrs = append(allErrs, field.Required(fldPath.Child("pods"), "must populate information for the given metric source"))
+		}
+		expectedField = "pods"
+	case autoscaling.ResourceMetricSourceType:
+		if spec.Resource == nil {
+			allErrs = append(allErrs, field.Required(fldPath.Child("resource"), "must populate information for the given metric source"))
+		}
+		expectedField = "resource"
+	case autoscaling.ExternalMetricSourceType:
+		if spec.External == nil {
+			allErrs = append(allErrs, field.Required(fldPath.Child("external"), "must populate information for the given metric source"))
+		}
+		expectedField = "external"
+	case autoscaling.ContainerResourceMetricSourceType:
+		if spec.ContainerResource == nil {
+			allErrs = append(allErrs, field.Required(fldPath.Child("containerResource"), "must populate information for the given metric source"))
+		}
+		expectedField = "containerResource"
+	default:
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("type"), spec.Type, validMetricSourceTypesList))
 	}
 
 	if typesPresent.Len() != 1 {
@@ -337,6 +360,34 @@ func validatePodsSource(src *autoscaling.PodsMetricSource, fldPath *field.Path) 
 
 	if src.Target.AverageValue == nil {
 		allErrs = append(allErrs, field.Required(fldPath.Child("target").Child("averageValue"), "must specify a positive target averageValue"))
+	}
+
+	return allErrs
+}
+
+func validateContainerResourceSource(src *autoscaling.ContainerResourceMetricSource, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+
+	if len(src.Name) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("name"), "must specify a resource name"))
+	} else {
+		allErrs = append(allErrs, corevalidation.ValidateContainerResourceName(src.Name, fldPath.Child("name"))...)
+	}
+
+	if len(src.Container) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("container"), "must specify a container"))
+	} else {
+		allErrs = append(allErrs, apivalidation.ValidateDNS1123Label(src.Container, fldPath.Child("container"))...)
+	}
+
+	allErrs = append(allErrs, validateMetricTarget(src.Target, fldPath.Child("target"))...)
+
+	if src.Target.AverageUtilization == nil && src.Target.AverageValue == nil {
+		allErrs = append(allErrs, field.Required(fldPath.Child("target").Child("averageUtilization"), "must set either a target raw value or a target utilization"))
+	}
+
+	if src.Target.AverageUtilization != nil && src.Target.AverageValue != nil {
+		allErrs = append(allErrs, field.Forbidden(fldPath.Child("target").Child("averageValue"), "may not set both a target raw value and a target utilization"))
 	}
 
 	return allErrs

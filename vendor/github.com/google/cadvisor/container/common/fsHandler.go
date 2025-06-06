@@ -22,7 +22,7 @@ import (
 
 	"github.com/google/cadvisor/fs"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 type FsHandler interface {
@@ -96,7 +96,12 @@ func (fh *realFsHandler) update() error {
 		fh.usage.TotalUsageBytes = rootUsage.Bytes
 	}
 	if fh.extraDir != "" && extraErr == nil {
-		fh.usage.TotalUsageBytes += extraUsage.Bytes
+		if fh.rootfs != "" {
+			fh.usage.TotalUsageBytes += extraUsage.Bytes
+		} else {
+			// rootfs is empty, totalUsageBytes use extra usage bytes
+			fh.usage.TotalUsageBytes = extraUsage.Bytes
+		}
 	}
 
 	// Combine errors into a single error to return

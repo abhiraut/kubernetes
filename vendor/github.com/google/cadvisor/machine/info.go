@@ -17,33 +17,35 @@ package machine
 import (
 	"bytes"
 	"flag"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
+	"github.com/google/cadvisor/nvm"
 	"github.com/google/cadvisor/utils/cloudinfo"
 	"github.com/google/cadvisor/utils/sysfs"
 	"github.com/google/cadvisor/utils/sysinfo"
 
-	"k8s.io/klog"
-
-	"golang.org/x/sys/unix"
+	"k8s.io/klog/v2"
 )
 
 const hugepagesDirectory = "/sys/kernel/mm/hugepages/"
 const memoryControllerPath = "/sys/devices/system/edac/mc/"
 
-var machineIdFilePath = flag.String("machine_id_file", "/etc/machine-id,/var/lib/dbus/machine-id", "Comma-separated list of files to check for machine-id. Use the first one that exists.")
-var bootIdFilePath = flag.String("boot_id_file", "/proc/sys/kernel/random/boot_id", "Comma-separated list of files to check for boot-id. Use the first one that exists.")
+var machineIDFilePath = flag.String("machine_id_file", "/etc/machine-id,/var/lib/dbus/machine-id", "Comma-separated list of files to check for machine-id. Use the first one that exists.")
+var bootIDFilePath = flag.String("boot_id_file", "/proc/sys/kernel/random/boot_id", "Comma-separated list of files to check for boot-id. Use the first one that exists.")
 
 func getInfoFromFiles(filePaths string) string {
 	if len(filePaths) == 0 {
 		return ""
 	}
 	for _, file := range strings.Split(filePaths, ",") {
-		id, err := ioutil.ReadFile(file)
+		id, err := os.ReadFile(file)
 		if err == nil {
 			return strings.TrimSpace(string(id))
 		}
@@ -58,7 +60,7 @@ func Info(sysFs sysfs.SysFs, fsInfo fs.FsInfo, inHostNamespace bool) (*info.Mach
 		rootFs = "/rootfs"
 	}
 
-	cpuinfo, err := ioutil.ReadFile(filepath.Join(rootFs, "/proc/cpuinfo"))
+	cpuinfo, err := os.ReadFile(filepath.Join(rootFs, "/proc/cpuinfo"))
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +79,12 @@ func Info(sysFs sysfs.SysFs, fsInfo fs.FsInfo, inHostNamespace bool) (*info.Mach
 		return nil, err
 	}
 
-	nvmInfo, err := GetNVMInfo()
+	swapCapacity, err := GetMachineSwapCapacity()
+	if err != nil {
+		return nil, err
+	}
+
+	nvmInfo, err := nvm.GetInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -118,20 +125,23 @@ func Info(sysFs sysfs.SysFs, fsInfo fs.FsInfo, inHostNamespace bool) (*info.Mach
 	instanceID := realCloudInfo.GetInstanceID()
 
 	machineInfo := &info.MachineInfo{
+		Timestamp:        time.Now(),
+		CPUVendorID:      GetCPUVendorID(cpuinfo),
 		NumCores:         numCores,
 		NumPhysicalCores: GetPhysicalCores(cpuinfo),
 		NumSockets:       GetSockets(cpuinfo),
 		CpuFrequency:     clockSpeed,
 		MemoryCapacity:   memoryCapacity,
 		MemoryByType:     memoryByType,
+		SwapCapacity:     swapCapacity,
 		NVMInfo:          nvmInfo,
 		HugePages:        hugePagesInfo,
 		DiskMap:          diskMap,
 		NetworkDevices:   netDevices,
 		Topology:         topology,
-		MachineID:        getInfoFromFiles(filepath.Join(rootFs, *machineIdFilePath)),
+		MachineID:        getInfoFromFiles(filepath.Join(rootFs, *machineIDFilePath)),
 		SystemUUID:       systemUUID,
-		BootID:           getInfoFromFiles(filepath.Join(rootFs, *bootIdFilePath)),
+		BootID:           getInfoFromFiles(filepath.Join(rootFs, *bootIDFilePath)),
 		CloudProvider:    cloudProvider,
 		InstanceType:     instanceType,
 		InstanceID:       instanceID,

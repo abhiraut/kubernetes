@@ -18,6 +18,7 @@ package pod
 
 import (
 	"fmt"
+	"iter"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -37,6 +38,17 @@ func FindPort(pod *v1.Pod, svcPort *v1.ServicePort) (int, error) {
 	case intstr.String:
 		name := portName.StrVal
 		for _, container := range pod.Spec.Containers {
+			for _, port := range container.Ports {
+				if port.Name == name && port.Protocol == svcPort.Protocol {
+					return int(port.ContainerPort), nil
+				}
+			}
+		}
+		// also support sidecar container (initContainer with restartPolicy=Always)
+		for _, container := range pod.Spec.InitContainers {
+			if container.RestartPolicy == nil || *container.RestartPolicy != v1.ContainerRestartPolicyAlways {
+				continue
+			}
 			for _, port := range container.Ports {
 				if port.Name == name && port.Protocol == svcPort.Protocol {
 					return int(port.ContainerPort), nil
@@ -63,16 +75,12 @@ const (
 )
 
 // AllContainers specifies that all containers be visited
-const AllContainers ContainerType = (InitContainers | Containers | EphemeralContainers)
+const AllContainers ContainerType = InitContainers | Containers | EphemeralContainers
 
 // AllFeatureEnabledContainers returns a ContainerType mask which includes all container
 // types except for the ones guarded by feature gate.
 func AllFeatureEnabledContainers() ContainerType {
-	containerType := AllContainers
-	if !utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
-		containerType &= ^EphemeralContainers
-	}
-	return containerType
+	return AllContainers
 }
 
 // ContainerVisitor is called with each container spec, and returns true
@@ -82,33 +90,56 @@ type ContainerVisitor func(container *v1.Container, containerType ContainerType)
 // Visitor is called with each object name, and returns true if visiting should continue
 type Visitor func(name string) (shouldContinue bool)
 
+func skipEmptyNames(visitor Visitor) Visitor {
+	return func(name string) bool {
+		if len(name) == 0 {
+			// continue visiting
+			return true
+		}
+		// delegate to visitor
+		return visitor(name)
+	}
+}
+
 // VisitContainers invokes the visitor function with a pointer to every container
 // spec in the given pod spec with type set in mask. If visitor returns false,
 // visiting is short-circuited. VisitContainers returns true if visiting completes,
 // false if visiting was short-circuited.
 func VisitContainers(podSpec *v1.PodSpec, mask ContainerType, visitor ContainerVisitor) bool {
-	if mask&InitContainers != 0 {
-		for i := range podSpec.InitContainers {
-			if !visitor(&podSpec.InitContainers[i], InitContainers) {
-				return false
-			}
-		}
-	}
-	if mask&Containers != 0 {
-		for i := range podSpec.Containers {
-			if !visitor(&podSpec.Containers[i], Containers) {
-				return false
-			}
-		}
-	}
-	if mask&EphemeralContainers != 0 {
-		for i := range podSpec.EphemeralContainers {
-			if !visitor((*v1.Container)(&podSpec.EphemeralContainers[i].EphemeralContainerCommon), EphemeralContainers) {
-				return false
-			}
+	for c, t := range ContainerIter(podSpec, mask) {
+		if !visitor(c, t) {
+			return false
 		}
 	}
 	return true
+}
+
+// ContainerIter returns an iterator over all containers in the given pod spec with a masked type.
+// The iteration order is InitContainers, then main Containers, then EphemeralContainers.
+func ContainerIter(podSpec *v1.PodSpec, mask ContainerType) iter.Seq2[*v1.Container, ContainerType] {
+	return func(yield func(*v1.Container, ContainerType) bool) {
+		if mask&InitContainers != 0 {
+			for i := range podSpec.InitContainers {
+				if !yield(&podSpec.InitContainers[i], InitContainers) {
+					return
+				}
+			}
+		}
+		if mask&Containers != 0 {
+			for i := range podSpec.Containers {
+				if !yield(&podSpec.Containers[i], Containers) {
+					return
+				}
+			}
+		}
+		if mask&EphemeralContainers != 0 {
+			for i := range podSpec.EphemeralContainers {
+				if !yield((*v1.Container)(&podSpec.EphemeralContainers[i].EphemeralContainerCommon), EphemeralContainers) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // VisitPodSecretNames invokes the visitor function with the name of every secret
@@ -116,6 +147,7 @@ func VisitContainers(podSpec *v1.PodSpec, mask ContainerType, visitor ContainerV
 // Transitive references (e.g. pod -> pvc -> pv -> secret) are not visited.
 // Returns true if visiting completed, false if visiting was short-circuited.
 func VisitPodSecretNames(pod *v1.Pod, visitor Visitor) bool {
+	visitor = skipEmptyNames(visitor)
 	for _, reference := range pod.Spec.ImagePullSecrets {
 		if !visitor(reference.Name) {
 			return false
@@ -182,6 +214,7 @@ func VisitPodSecretNames(pod *v1.Pod, visitor Visitor) bool {
 	return true
 }
 
+// visitContainerSecretNames returns true unless the visitor returned false when invoked with a secret reference
 func visitContainerSecretNames(container *v1.Container, visitor Visitor) bool {
 	for _, env := range container.EnvFrom {
 		if env.SecretRef != nil {
@@ -205,6 +238,7 @@ func visitContainerSecretNames(container *v1.Container, visitor Visitor) bool {
 // Transitive references (e.g. pod -> pvc -> pv -> secret) are not visited.
 // Returns true if visiting completed, false if visiting was short-circuited.
 func VisitPodConfigmapNames(pod *v1.Pod, visitor Visitor) bool {
+	visitor = skipEmptyNames(visitor)
 	VisitContainers(&pod.Spec, AllContainers, func(c *v1.Container, containerType ContainerType) bool {
 		return visitContainerConfigmapNames(c, visitor)
 	})
@@ -229,6 +263,7 @@ func VisitPodConfigmapNames(pod *v1.Pod, visitor Visitor) bool {
 	return true
 }
 
+// visitContainerConfigmapNames returns true unless the visitor returned false when invoked with a configmap reference
 func visitContainerConfigmapNames(container *v1.Container, visitor Visitor) bool {
 	for _, env := range container.EnvFrom {
 		if env.ConfigMapRef != nil {
@@ -248,7 +283,7 @@ func visitContainerConfigmapNames(container *v1.Container, visitor Visitor) bool
 }
 
 // GetContainerStatus extracts the status of container "name" from "statuses".
-// It also returns if "name" exists.
+// It returns true if "name" exists, else returns false.
 func GetContainerStatus(statuses []v1.ContainerStatus, name string) (v1.ContainerStatus, bool) {
 	for i := range statuses {
 		if statuses[i].Name == name {
@@ -265,6 +300,17 @@ func GetExistingContainerStatus(statuses []v1.ContainerStatus, name string) v1.C
 	return status
 }
 
+// GetIndexOfContainerStatus gets the index of status of container "name" from "statuses",
+// It returns (index, true) if "name" exists, else returns (0, false).
+func GetIndexOfContainerStatus(statuses []v1.ContainerStatus, name string) (int, bool) {
+	for i := range statuses {
+		if statuses[i].Name == name {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // IsPodAvailable returns true if a pod is available; false otherwise.
 // Precondition for an available pod is that it must be ready. On top
 // of that, there are two cases when a pod can be considered available:
@@ -277,7 +323,7 @@ func IsPodAvailable(pod *v1.Pod, minReadySeconds int32, now metav1.Time) bool {
 
 	c := GetPodReadyCondition(pod.Status)
 	minReadySecondsDuration := time.Duration(minReadySeconds) * time.Second
-	if minReadySeconds == 0 || !c.LastTransitionTime.IsZero() && c.LastTransitionTime.Add(minReadySecondsDuration).Before(now.Time) {
+	if minReadySeconds == 0 || (!c.LastTransitionTime.IsZero() && c.LastTransitionTime.Add(minReadySecondsDuration).Before(now.Time)) {
 		return true
 	}
 	return false
@@ -288,9 +334,25 @@ func IsPodReady(pod *v1.Pod) bool {
 	return IsPodReadyConditionTrue(pod.Status)
 }
 
+// IsPodTerminal returns true if a pod is terminal, all containers are stopped and cannot ever regress.
+func IsPodTerminal(pod *v1.Pod) bool {
+	return IsPodPhaseTerminal(pod.Status.Phase)
+}
+
+// IsPodPhaseTerminal returns true if the pod's phase is terminal.
+func IsPodPhaseTerminal(phase v1.PodPhase) bool {
+	return phase == v1.PodFailed || phase == v1.PodSucceeded
+}
+
 // IsPodReadyConditionTrue returns true if a pod is ready; false otherwise.
 func IsPodReadyConditionTrue(status v1.PodStatus) bool {
 	condition := GetPodReadyCondition(status)
+	return condition != nil && condition.Status == v1.ConditionTrue
+}
+
+// IsContainersReadyConditionTrue returns true if a pod is ready; false otherwise.
+func IsContainersReadyConditionTrue(status v1.PodStatus) bool {
+	condition := GetContainersReadyCondition(status)
 	return condition != nil && condition.Status == v1.ConditionTrue
 }
 
@@ -298,6 +360,13 @@ func IsPodReadyConditionTrue(status v1.PodStatus) bool {
 // Returns nil if the condition is not present.
 func GetPodReadyCondition(status v1.PodStatus) *v1.PodCondition {
 	_, condition := GetPodCondition(&status, v1.PodReady)
+	return condition
+}
+
+// GetContainersReadyCondition extracts the containers ready condition from the given status and returns that.
+// Returns nil if the condition is not present.
+func GetContainersReadyCondition(status v1.PodStatus) *v1.PodCondition {
+	_, condition := GetPodCondition(&status, v1.ContainersReady)
 	return condition
 }
 
@@ -353,13 +422,45 @@ func UpdatePodCondition(status *v1.PodStatus, condition *v1.PodCondition) bool {
 	return !isEqual
 }
 
-// GetPodPriority returns priority of the given pod.
-func GetPodPriority(pod *v1.Pod) int32 {
-	if pod.Spec.Priority != nil {
-		return *pod.Spec.Priority
+// IsRestartableInitContainer returns true if the container has ContainerRestartPolicyAlways.
+// This function is not checking if the container passed to it is indeed an init container.
+// It is just checking if the container restart policy has been set to always.
+func IsRestartableInitContainer(initContainer *v1.Container) bool {
+	if initContainer == nil || initContainer.RestartPolicy == nil {
+		return false
 	}
-	// When priority of a running pod is nil, it means it was created at a time
-	// that there was no global default priority class and the priority class
-	// name of the pod was empty. So, we resolve to the static default priority.
+	return *initContainer.RestartPolicy == v1.ContainerRestartPolicyAlways
+}
+
+// CalculatePodStatusObservedGeneration calculates the observedGeneration for the pod status.
+// This is used to track the generation of the pod that was observed by the kubelet.
+// The observedGeneration is set to the pod's generation when the feature gate
+// PodObservedGenerationTracking is enabled OR if status.observedGeneration is already set.
+// This protects against an infinite loop of kubelet trying to clear the value after the FG is turned off, and
+// the API server preserving existing values when an incoming update tries to clear it.
+func CalculatePodStatusObservedGeneration(pod *v1.Pod) int64 {
+	if pod.Status.ObservedGeneration != 0 || utilfeature.DefaultFeatureGate.Enabled(features.PodObservedGenerationTracking) {
+		return pod.Generation
+	}
+	return 0
+}
+
+// CalculatePodConditionObservedGeneration calculates the observedGeneration for a particular pod condition.
+// The observedGeneration is set to the pod's generation when the feature gate
+// PodObservedGenerationTracking is enabled OR if condition[].observedGeneration is already set.
+// This protects against an infinite loop of kubelet trying to clear the value after the FG is turned off, and
+// the API server preserving existing values when an incoming update tries to clear it.
+func CalculatePodConditionObservedGeneration(podStatus *v1.PodStatus, generation int64, conditionType v1.PodConditionType) int64 {
+	if podStatus == nil {
+		return 0
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodObservedGenerationTracking) {
+		return generation
+	}
+	for _, condition := range podStatus.Conditions {
+		if condition.Type == conditionType && condition.ObservedGeneration != 0 {
+			return generation
+		}
+	}
 	return 0
 }

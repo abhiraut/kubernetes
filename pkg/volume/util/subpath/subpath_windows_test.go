@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 /*
@@ -39,7 +40,7 @@ func makeLink(link, target string) error {
 func TestDoSafeMakeDir(t *testing.T) {
 	base, err := ioutil.TempDir("", "TestDoSafeMakeDir")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("failed to create temporary directory: %v", err)
 	}
 
 	defer os.RemoveAll(base)
@@ -135,7 +136,7 @@ func TestDoSafeMakeDir(t *testing.T) {
 func TestLockAndCheckSubPath(t *testing.T) {
 	base, err := ioutil.TempDir("", "TestLockAndCheckSubPath")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("failed to create temporary directory: %v", err)
 	}
 
 	defer os.RemoveAll(base)
@@ -239,7 +240,7 @@ func TestLockAndCheckSubPath(t *testing.T) {
 func TestLockAndCheckSubPathWithoutSymlink(t *testing.T) {
 	base, err := ioutil.TempDir("", "TestLockAndCheckSubPathWithoutSymlink")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("failed to create temporary directory: %v", err)
 	}
 
 	defer os.RemoveAll(base)
@@ -343,7 +344,7 @@ func TestLockAndCheckSubPathWithoutSymlink(t *testing.T) {
 func TestFindExistingPrefix(t *testing.T) {
 	base, err := ioutil.TempDir("", "TestFindExistingPrefix")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatalf("failed to create temporary directory: %v", err)
 	}
 
 	defer os.RemoveAll(base)
@@ -437,4 +438,42 @@ func TestFindExistingPrefix(t *testing.T) {
 	}
 	// remove dir will happen after closing all file handles
 	assert.Nil(t, os.RemoveAll(testingVolumePath), "Expect no error during remove dir %s", testingVolumePath)
+}
+
+func TestIsDriveLetterorEmptyPath(t *testing.T) {
+	tests := []struct {
+		path           string
+		expectedResult bool
+	}{
+		{
+			path:           ``,
+			expectedResult: true,
+		},
+		{
+			path:           `\tmp`,
+			expectedResult: false,
+		},
+		{
+			path:           `c:\tmp`,
+			expectedResult: false,
+		},
+		{
+			path:           `c:\\`,
+			expectedResult: true,
+		},
+		{
+			path:           `c:\`,
+			expectedResult: true,
+		},
+		{
+			path:           `c:`,
+			expectedResult: true,
+		},
+	}
+
+	for _, test := range tests {
+		result := isDriveLetterorEmptyPath(test.path)
+		assert.Equal(t, test.expectedResult, result, "Expect result not equal with isDriveLetterorEmptyPath(%s) return: %t, expected: %t",
+			test.path, result, test.expectedResult)
+	}
 }

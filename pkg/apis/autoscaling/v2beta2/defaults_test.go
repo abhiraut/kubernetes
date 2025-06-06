@@ -17,13 +17,21 @@ limitations under the License.
 package v2beta2_test
 
 import (
+	"reflect"
 	"testing"
 
-	autoscalingv2 "k8s.io/api/autoscaling/v2beta2"
-	. "k8s.io/kubernetes/pkg/apis/autoscaling/v2beta2"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+	autoscalingv2 "k8s.io/api/autoscaling/v2beta2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/kubernetes/pkg/apis/autoscaling"
+	_ "k8s.io/kubernetes/pkg/apis/autoscaling/install"
+	. "k8s.io/kubernetes/pkg/apis/autoscaling/v2beta2"
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	utilpointer "k8s.io/utils/pointer"
 )
 
 func TestGenerateScaleDownRules(t *testing.T) {
@@ -57,13 +65,13 @@ func TestGenerateScaleDownRules(t *testing.T) {
 			rateDownPodsPeriodSeconds:    2,
 			rateDownPercent:              3,
 			rateDownPercentPeriodSeconds: 4,
-			stabilizationSeconds:         utilpointer.Int32Ptr(25),
+			stabilizationSeconds:         utilpointer.Int32(25),
 			selectPolicy:                 &maxPolicy,
 			expectedPolicies: []autoscalingv2.HPAScalingPolicy{
 				{Type: autoscalingv2.PodsScalingPolicy, Value: 1, PeriodSeconds: 2},
 				{Type: autoscalingv2.PercentScalingPolicy, Value: 3, PeriodSeconds: 4},
 			},
-			expectedStabilization: utilpointer.Int32Ptr(25),
+			expectedStabilization: utilpointer.Int32(25),
 			expectedSelectPolicy:  string(autoscalingv2.MaxPolicySelect),
 		},
 		{
@@ -139,7 +147,7 @@ func TestGenerateScaleUpRules(t *testing.T) {
 				{Type: autoscalingv2.PodsScalingPolicy, Value: 4, PeriodSeconds: 15},
 				{Type: autoscalingv2.PercentScalingPolicy, Value: 100, PeriodSeconds: 15},
 			},
-			expectedStabilization: utilpointer.Int32Ptr(0),
+			expectedStabilization: utilpointer.Int32(0),
 			expectedSelectPolicy:  string(autoscalingv2.MaxPolicySelect),
 		},
 		{
@@ -148,13 +156,13 @@ func TestGenerateScaleUpRules(t *testing.T) {
 			rateUpPodsPeriodSeconds:    2,
 			rateUpPercent:              3,
 			rateUpPercentPeriodSeconds: 4,
-			stabilizationSeconds:       utilpointer.Int32Ptr(25),
+			stabilizationSeconds:       utilpointer.Int32(25),
 			selectPolicy:               &maxPolicy,
 			expectedPolicies: []autoscalingv2.HPAScalingPolicy{
 				{Type: autoscalingv2.PodsScalingPolicy, Value: 1, PeriodSeconds: 2},
 				{Type: autoscalingv2.PercentScalingPolicy, Value: 3, PeriodSeconds: 4},
 			},
-			expectedStabilization: utilpointer.Int32Ptr(25),
+			expectedStabilization: utilpointer.Int32(25),
 			expectedSelectPolicy:  string(autoscalingv2.MaxPolicySelect),
 		},
 		{
@@ -165,7 +173,7 @@ func TestGenerateScaleUpRules(t *testing.T) {
 			expectedPolicies: []autoscalingv2.HPAScalingPolicy{
 				{Type: autoscalingv2.PodsScalingPolicy, Value: 1, PeriodSeconds: 2},
 			},
-			expectedStabilization: utilpointer.Int32Ptr(0),
+			expectedStabilization: utilpointer.Int32(0),
 			expectedSelectPolicy:  string(autoscalingv2.MinPolicySelect),
 		},
 		{
@@ -175,29 +183,29 @@ func TestGenerateScaleUpRules(t *testing.T) {
 			expectedPolicies: []autoscalingv2.HPAScalingPolicy{
 				{Type: autoscalingv2.PercentScalingPolicy, Value: 7, PeriodSeconds: 10},
 			},
-			expectedStabilization: utilpointer.Int32Ptr(0),
+			expectedStabilization: utilpointer.Int32(0),
 			expectedSelectPolicy:  string(autoscalingv2.MaxPolicySelect),
 		},
 		{
 			annotation:              "Pod policy and stabilization window are specified",
 			rateUpPodsPeriodSeconds: 2,
-			stabilizationSeconds:    utilpointer.Int32Ptr(25),
+			stabilizationSeconds:    utilpointer.Int32(25),
 			rateUpPods:              4,
 			expectedPolicies: []autoscalingv2.HPAScalingPolicy{
 				{Type: autoscalingv2.PodsScalingPolicy, Value: 4, PeriodSeconds: 2},
 			},
-			expectedStabilization: utilpointer.Int32Ptr(25),
+			expectedStabilization: utilpointer.Int32(25),
 			expectedSelectPolicy:  string(autoscalingv2.MaxPolicySelect),
 		},
 		{
 			annotation:                 "Percent policy and stabilization window are specified",
 			rateUpPercent:              7,
 			rateUpPercentPeriodSeconds: 60,
-			stabilizationSeconds:       utilpointer.Int32Ptr(25),
+			stabilizationSeconds:       utilpointer.Int32(25),
 			expectedPolicies: []autoscalingv2.HPAScalingPolicy{
 				{Type: autoscalingv2.PercentScalingPolicy, Value: 7, PeriodSeconds: 60},
 			},
-			expectedStabilization: utilpointer.Int32Ptr(25),
+			expectedStabilization: utilpointer.Int32(25),
 			expectedSelectPolicy:  string(autoscalingv2.MaxPolicySelect),
 		},
 	}
@@ -228,4 +236,89 @@ func TestGenerateScaleUpRules(t *testing.T) {
 			assert.Equal(t, autoscalingv2.ScalingPolicySelect(tc.expectedSelectPolicy), *up.SelectPolicy)
 		})
 	}
+}
+
+func TestHorizontalPodAutoscalerAnnotations(t *testing.T) {
+	tests := []struct {
+		hpa  autoscalingv2.HorizontalPodAutoscaler
+		test string
+	}{
+		{
+			hpa: autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						autoscaling.HorizontalPodAutoscalerConditionsAnnotation: "",
+						autoscaling.MetricSpecsAnnotation:                       "",
+						autoscaling.BehaviorSpecsAnnotation:                     "",
+						autoscaling.MetricStatusesAnnotation:                    "",
+					},
+				},
+			},
+			test: "test empty value for Annotations",
+		},
+		{
+			hpa: autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						autoscaling.HorizontalPodAutoscalerConditionsAnnotation: "abc",
+						autoscaling.MetricSpecsAnnotation:                       "abc",
+						autoscaling.BehaviorSpecsAnnotation:                     "abc",
+						autoscaling.MetricStatusesAnnotation:                    "abc",
+					},
+				},
+			},
+			test: "test random value for Annotations",
+		},
+		{
+			hpa: autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						autoscaling.HorizontalPodAutoscalerConditionsAnnotation: "[]",
+						autoscaling.MetricSpecsAnnotation:                       "[]",
+						autoscaling.BehaviorSpecsAnnotation:                     "[]",
+						autoscaling.MetricStatusesAnnotation:                    "[]",
+					},
+				},
+			},
+			test: "test empty array value for Annotations",
+		},
+	}
+
+	for _, test := range tests {
+		hpa := &test.hpa
+		hpaBeforeMuatate := *hpa.DeepCopy()
+		obj := roundTrip(t, runtime.Object(hpa))
+		final_obj, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler)
+		if !ok {
+			t.Fatalf("unexpected object: %v", obj)
+		}
+		if !reflect.DeepEqual(*hpa, hpaBeforeMuatate) {
+			t.Errorf("diff: %v", cmp.Diff(*hpa, hpaBeforeMuatate))
+			t.Errorf("expected: %#v\n actual:   %#v", *hpa, hpaBeforeMuatate)
+		}
+
+		if len(final_obj.ObjectMeta.Annotations) != 0 {
+			t.Fatalf("unexpected annotations: %v", final_obj.ObjectMeta.Annotations)
+		}
+	}
+}
+
+func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
+	data, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(SchemeGroupVersion), obj)
+	if err != nil {
+		t.Errorf("%v\n %#v", err, obj)
+		return nil
+	}
+	obj2, err := runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), data)
+	if err != nil {
+		t.Errorf("%v\nData: %s\nSource: %#v", err, string(data), obj)
+		return nil
+	}
+	obj3 := reflect.New(reflect.TypeOf(obj).Elem()).Interface().(runtime.Object)
+	err = legacyscheme.Scheme.Convert(obj2, obj3, nil)
+	if err != nil {
+		t.Errorf("%v\nSource: %#v", err, obj2)
+		return nil
+	}
+	return obj3
 }

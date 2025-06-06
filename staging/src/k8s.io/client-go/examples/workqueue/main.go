@@ -17,11 +17,13 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,13 +36,15 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
+// Controller demonstrates how to implement a controller with client-go.
 type Controller struct {
 	indexer  cache.Indexer
-	queue    workqueue.RateLimitingInterface
+	queue    workqueue.TypedRateLimitingInterface[string]
 	informer cache.Controller
 }
 
-func NewController(queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller) *Controller {
+// NewController creates a new Controller.
+func NewController(queue workqueue.TypedRateLimitingInterface[string], indexer cache.Indexer, informer cache.Controller) *Controller {
 	return &Controller{
 		informer: informer,
 		indexer:  indexer,
@@ -60,7 +64,7 @@ func (c *Controller) processNextItem() bool {
 	defer c.queue.Done(key)
 
 	// Invoke the method containing the business logic
-	err := c.syncToStdout(key.(string))
+	err := c.syncToStdout(key)
 	// Handle the error if something went wrong during the execution of the business logic
 	c.handleErr(err, key)
 	return true
@@ -88,7 +92,7 @@ func (c *Controller) syncToStdout(key string) error {
 }
 
 // handleErr checks if an error happened and makes sure we will retry later.
-func (c *Controller) handleErr(err error, key interface{}) {
+func (c *Controller) handleErr(err error, key string) {
 	if err == nil {
 		// Forget about the #AddRateLimited history of the key on every successful synchronization.
 		// This ensures that future processing of updates for this key is not delayed because of
@@ -113,30 +117,31 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	klog.Infof("Dropping pod %q out of the queue: %v", key, err)
 }
 
-func (c *Controller) Run(threadiness int, stopCh chan struct{}) {
-	defer runtime.HandleCrash()
+// Run begins watching and syncing.
+func (c *Controller) Run(ctx context.Context, workers int) {
+	defer runtime.HandleCrashWithContext(ctx)
 
 	// Let the workers stop when we are done
 	defer c.queue.ShutDown()
 	klog.Info("Starting Pod controller")
 
-	go c.informer.Run(stopCh)
+	go c.informer.RunWithContext(ctx)
 
 	// Wait for all involved caches to be synced, before processing items from the queue is started
-	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, c.informer.HasSynced) {
 		runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
 		return
 	}
 
-	for i := 0; i < threadiness; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	<-stopCh
+	<-ctx.Done()
 	klog.Info("Stopping Pod controller")
 }
 
-func (c *Controller) runWorker() {
+func (c *Controller) runWorker(ctx context.Context) {
 	for c.processNextItem() {
 	}
 }
@@ -161,11 +166,13 @@ func main() {
 		klog.Fatal(err)
 	}
 
+	ctx := context.Background()
+
 	// create the pod watcher
 	podListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", v1.NamespaceDefault, fields.Everything())
 
 	// create the workqueue
-	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 
 	// Bind the workqueue to a cache with the help of an informer. This way we make sure that
 	// whenever the cache is updated, the pod key is added to the workqueue.
@@ -208,9 +215,9 @@ func main() {
 	})
 
 	// Now let's start the controller
-	stop := make(chan struct{})
-	defer close(stop)
-	go controller.Run(1, stop)
+	cancelCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(errors.New("time to stop because main has completed"))
+	go controller.Run(cancelCtx, 1)
 
 	// Wait forever
 	select {}

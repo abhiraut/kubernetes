@@ -17,17 +17,17 @@ limitations under the License.
 package podautoscaler
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"testing"
 	"time"
 
-	autoscalingv2 "k8s.io/api/autoscaling/v2beta2"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta/testrestmapper"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -52,7 +52,7 @@ import (
 type resourceInfo struct {
 	name     v1.ResourceName
 	requests []resource.Quantity
-	levels   []int64
+	levels   [][]int64
 	// only applies to pod names returned from "heapster"
 	podNames []string
 
@@ -78,9 +78,9 @@ type metricInfo struct {
 	selector     *metav1.LabelSelector
 	metricType   metricType
 
-	targetUtilization       int64
-	perPodTargetUtilization int64
-	expectedUtilization     int64
+	targetUsage       int64
+	perPodTargetUsage int64
+	expectedUsage     int64
 }
 
 type replicaCalcTestCase struct {
@@ -90,9 +90,10 @@ type replicaCalcTestCase struct {
 
 	timestamp time.Time
 
-	resource            *resourceInfo
-	metric              *metricInfo
-	metricLabelSelector labels.Selector
+	tolerances *Tolerances
+	resource   *resourceInfo
+	metric     *metricInfo
+	container  string
 
 	podReadiness         []v1.ConditionStatus
 	podStartTime         []metav1.Time
@@ -152,7 +153,7 @@ func (tc *replicaCalcTestCase) prepareTestClientSet() *fake.Clientset {
 					},
 				},
 				Spec: v1.PodSpec{
-					Containers: []v1.Container{{}, {}},
+					Containers: []v1.Container{{Name: "container1"}, {Name: "container2"}},
 				},
 			}
 			if podDeletionTimestamp {
@@ -202,13 +203,11 @@ func (tc *replicaCalcTestCase) prepareTestMetricsClient() *metricsfake.Clientset
 					Containers: make([]metricsapi.ContainerMetrics, numContainersPerPod),
 				}
 
-				for i := 0; i < numContainersPerPod; i++ {
+				for i, m := range resValue {
 					podMetric.Containers[i] = metricsapi.ContainerMetrics{
-						Name: fmt.Sprintf("container%v", i),
+						Name: fmt.Sprintf("container%v", i+1),
 						Usage: v1.ResourceList{
-							v1.ResourceName(tc.resource.name): *resource.NewMilliQuantity(
-								int64(resValue),
-								resource.DecimalSI),
+							tc.resource.name: *resource.NewMilliQuantity(m, resource.DecimalSI),
 						},
 					}
 				}
@@ -345,7 +344,7 @@ func (tc *replicaCalcTestCase) runTest(t *testing.T) {
 	informerFactory := informers.NewSharedInformerFactory(testClient, controller.NoResyncPeriodFunc())
 	informer := informerFactory.Core().V1().Pods()
 
-	replicaCalc := NewReplicaCalculator(metricsClient, informer.Lister(), defaultTestingTolerance, defaultTestingCPUInitializationPeriod, defaultTestingDelayOfInitialReadinessStatus)
+	replicaCalc := NewReplicaCalculator(metricsClient, informer.Lister(), defaultTestingCPUInitializationPeriod, defaultTestingDelayOfInitialReadinessStatus)
 
 	stop := make(chan struct{})
 	defer close(stop)
@@ -357,16 +356,20 @@ func (tc *replicaCalcTestCase) runTest(t *testing.T) {
 	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 		MatchLabels: map[string]string{"name": podNamePrefix},
 	})
-	if err != nil {
-		require.Nil(t, err, "something went horribly wrong...")
+	require.NoError(t, err, "something went horribly wrong...")
+
+	// Use default if tolerances are not specified in the test case.
+	tolerances := Tolerances{defaultTestingTolerance, defaultTestingTolerance}
+	if tc.tolerances != nil {
+		tolerances = *tc.tolerances
 	}
 
 	if tc.resource != nil {
-		outReplicas, outUtilization, outRawValue, outTimestamp, err := replicaCalc.GetResourceReplicas(tc.currentReplicas, tc.resource.targetUtilization, tc.resource.name, testNamespace, selector)
+		outReplicas, outUtilization, outRawValue, outTimestamp, err := replicaCalc.GetResourceReplicas(context.TODO(), tc.currentReplicas, tc.resource.targetUtilization, tc.resource.name, tolerances, testNamespace, selector, tc.container)
 
 		if tc.expectedError != nil {
 			require.Error(t, err, "there should be an error calculating the replica count")
-			assert.Contains(t, err.Error(), tc.expectedError.Error(), "the error message should have contained the expected error message")
+			assert.ErrorContains(t, err, tc.expectedError.Error(), "the error message should have contained the expected error message")
 			return
 		}
 		require.NoError(t, err, "there should not have been an error calculating the replica count")
@@ -378,53 +381,62 @@ func (tc *replicaCalcTestCase) runTest(t *testing.T) {
 	}
 
 	var outReplicas int32
-	var outUtilization int64
+	var outUsage int64
 	var outTimestamp time.Time
 	switch tc.metric.metricType {
 	case objectMetric:
 		if tc.metric.singleObject == nil {
 			t.Fatal("Metric specified as objectMetric but metric.singleObject is nil.")
 		}
-		outReplicas, outUtilization, outTimestamp, err = replicaCalc.GetObjectMetricReplicas(tc.currentReplicas, tc.metric.targetUtilization, tc.metric.name, testNamespace, tc.metric.singleObject, selector, nil)
+		outReplicas, outUsage, outTimestamp, err = replicaCalc.GetObjectMetricReplicas(tc.currentReplicas, tc.metric.targetUsage, tc.metric.name, tolerances, testNamespace, tc.metric.singleObject, selector, nil)
 	case objectPerPodMetric:
 		if tc.metric.singleObject == nil {
 			t.Fatal("Metric specified as objectMetric but metric.singleObject is nil.")
 		}
-		outReplicas, outUtilization, outTimestamp, err = replicaCalc.GetObjectPerPodMetricReplicas(tc.currentReplicas, tc.metric.perPodTargetUtilization, tc.metric.name, testNamespace, tc.metric.singleObject, nil)
+		outReplicas, outUsage, outTimestamp, err = replicaCalc.GetObjectPerPodMetricReplicas(tc.currentReplicas, tc.metric.perPodTargetUsage, tc.metric.name, tolerances, testNamespace, tc.metric.singleObject, nil)
 	case externalMetric:
 		if tc.metric.selector == nil {
 			t.Fatal("Metric specified as externalMetric but metric.selector is nil.")
 		}
-		if tc.metric.targetUtilization <= 0 {
-			t.Fatalf("Metric specified as externalMetric but metric.targetUtilization is %d which is <=0.", tc.metric.targetUtilization)
+		if tc.metric.targetUsage <= 0 {
+			t.Fatalf("Metric specified as externalMetric but metric.targetUsage is %d which is <=0.", tc.metric.targetUsage)
 		}
-		outReplicas, outUtilization, outTimestamp, err = replicaCalc.GetExternalMetricReplicas(tc.currentReplicas, tc.metric.targetUtilization, tc.metric.name, testNamespace, tc.metric.selector, selector)
+		outReplicas, outUsage, outTimestamp, err = replicaCalc.GetExternalMetricReplicas(tc.currentReplicas, tc.metric.targetUsage, tc.metric.name, tolerances, testNamespace, tc.metric.selector, selector)
 	case externalPerPodMetric:
 		if tc.metric.selector == nil {
 			t.Fatal("Metric specified as externalPerPodMetric but metric.selector is nil.")
 		}
-		if tc.metric.perPodTargetUtilization <= 0 {
-			t.Fatalf("Metric specified as externalPerPodMetric but metric.perPodTargetUtilization is %d which is <=0.", tc.metric.perPodTargetUtilization)
+		if tc.metric.perPodTargetUsage <= 0 {
+			t.Fatalf("Metric specified as externalPerPodMetric but metric.perPodTargetUsage is %d which is <=0.", tc.metric.perPodTargetUsage)
 		}
 
-		outReplicas, outUtilization, outTimestamp, err = replicaCalc.GetExternalPerPodMetricReplicas(tc.currentReplicas, tc.metric.perPodTargetUtilization, tc.metric.name, testNamespace, tc.metric.selector)
+		outReplicas, outUsage, outTimestamp, err = replicaCalc.GetExternalPerPodMetricReplicas(tc.currentReplicas, tc.metric.perPodTargetUsage, tc.metric.name, tolerances, testNamespace, tc.metric.selector)
 	case podMetric:
-		outReplicas, outUtilization, outTimestamp, err = replicaCalc.GetMetricReplicas(tc.currentReplicas, tc.metric.targetUtilization, tc.metric.name, testNamespace, selector, nil)
+		outReplicas, outUsage, outTimestamp, err = replicaCalc.GetMetricReplicas(tc.currentReplicas, tc.metric.targetUsage, tc.metric.name, tolerances, testNamespace, selector, nil)
 	default:
 		t.Fatalf("Unknown metric type: %d", tc.metric.metricType)
 	}
 
 	if tc.expectedError != nil {
 		require.Error(t, err, "there should be an error calculating the replica count")
-		assert.Contains(t, err.Error(), tc.expectedError.Error(), "the error message should have contained the expected error message")
+		assert.ErrorContains(t, err, tc.expectedError.Error(), "the error message should have contained the expected error message")
 		return
 	}
 	require.NoError(t, err, "there should not have been an error calculating the replica count")
 	assert.Equal(t, tc.expectedReplicas, outReplicas, "replicas should be as expected")
-	assert.Equal(t, tc.metric.expectedUtilization, outUtilization, "utilization should be as expected")
+	assert.Equal(t, tc.metric.expectedUsage, outUsage, "usage should be as expected")
 	assert.True(t, tc.timestamp.Equal(outTimestamp), "timestamp should be as expected")
 }
-
+func makePodMetricLevels(containerMetric ...int64) [][]int64 {
+	metrics := make([][]int64, len(containerMetric))
+	for i := 0; i < len(containerMetric); i++ {
+		metrics[i] = make([]int64, numContainersPerPod)
+		for j := 0; j < numContainersPerPod; j++ {
+			metrics[i][j] = containerMetric[i]
+		}
+	}
+	return metrics
+}
 func TestReplicaCalcDisjointResourcesMetrics(t *testing.T) {
 	tc := replicaCalcTestCase{
 		currentReplicas: 1,
@@ -432,7 +444,7 @@ func TestReplicaCalcDisjointResourcesMetrics(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0")},
-			levels:   []int64{100},
+			levels:   makePodMetricLevels(100),
 			podNames: []string{"an-older-pod-name"},
 
 			targetUtilization: 100,
@@ -448,12 +460,30 @@ func TestReplicaCalcScaleUp(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{300, 500, 700},
+			levels:   makePodMetricLevels(300, 500, 700),
 
 			targetUtilization:   30,
 			expectedUtilization: 50,
 			expectedValue:       numContainersPerPod * 500,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcContainerScaleUp(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  3,
+		expectedReplicas: 5,
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 300}, {1000, 500}, {1000, 700}},
+
+			targetUtilization:   30,
+			expectedUtilization: 50,
+			expectedValue:       500,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -466,12 +496,31 @@ func TestReplicaCalcScaleUpUnreadyLessScale(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{300, 500, 700},
+			levels:   makePodMetricLevels(300, 500, 700),
 
 			targetUtilization:   30,
 			expectedUtilization: 60,
 			expectedValue:       numContainersPerPod * 600,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcScaleUpContainerHotCpuLessScale(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  3,
+		expectedReplicas: 4,
+		podStartTime:     []metav1.Time{hotCPUCreationTime(), coolCPUCreationTime(), coolCPUCreationTime()},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{0, 300}, {0, 500}, {0, 700}},
+
+			targetUtilization:   30,
+			expectedUtilization: 60,
+			expectedValue:       600,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -484,7 +533,7 @@ func TestReplicaCalcScaleUpHotCpuLessScale(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{300, 500, 700},
+			levels:   makePodMetricLevels(300, 500, 700),
 
 			targetUtilization:   30,
 			expectedUtilization: 60,
@@ -502,11 +551,43 @@ func TestReplicaCalcScaleUpUnreadyNoScale(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{400, 500, 700},
+			levels:   makePodMetricLevels(400, 500, 700),
 
 			targetUtilization:   30,
 			expectedUtilization: 40,
 			expectedValue:       numContainersPerPod * 400,
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestExternalPerPodMetricReplicaOverflow(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  1,
+		expectedReplicas: math.MaxInt32,
+		metric: &metricInfo{
+			name:              "qps",
+			levels:            []int64{math.MaxInt64},
+			perPodTargetUsage: 1, // Set to 1 to test replica calculation when targeting a 1:1 ratio between metric value and number of pods
+			metricType:        externalPerPodMetric,
+			expectedUsage:     math.MaxInt64,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestExternalPerPodMetricUsageOverflow(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  1,
+		expectedReplicas: 1,
+		metric: &metricInfo{
+			name:              "qps",
+			levels:            []int64{math.MaxInt64},
+			perPodTargetUsage: math.MaxInt64, // Set to a high value to test replica calculation when targeting a high value:1 ratio between metric value and number of pods
+			metricType:        externalPerPodMetric,
+			expectedUsage:     math.MaxInt64,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
 		},
 	}
 	tc.runTest(t)
@@ -521,7 +602,7 @@ func TestReplicaCalcScaleHotCpuNoScale(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{400, 500, 700},
+			levels:   makePodMetricLevels(400, 500, 700),
 
 			targetUtilization:   30,
 			expectedUtilization: 40,
@@ -540,12 +621,52 @@ func TestReplicaCalcScaleUpIgnoresFailedPods(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{500, 700},
+			levels:   makePodMetricLevels(500, 700),
 
 			targetUtilization:   30,
 			expectedUtilization: 60,
 			expectedValue:       numContainersPerPod * 600,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcMissingContainerMetricScaleUpIgnoresFailedPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  2,
+		expectedReplicas: 4,
+		podReadiness:     []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse},
+		podPhase:         []v1.PodPhase{v1.PodRunning, v1.PodRunning, v1.PodFailed, v1.PodFailed},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 500}, {9000, 700}, {1000}, {9000}},
+
+			targetUtilization:   30,
+			expectedUtilization: 60,
+			expectedValue:       600,
+		},
+		container: "container2",
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcScaleUpContainerIgnoresFailedPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  2,
+		expectedReplicas: 4,
+		podReadiness:     []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse},
+		podPhase:         []v1.PodPhase{v1.PodRunning, v1.PodRunning, v1.PodFailed, v1.PodFailed},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 500}, {9000, 700}},
+
+			targetUtilization:   30,
+			expectedUtilization: 60,
+			expectedValue:       600,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -560,7 +681,7 @@ func TestReplicaCalcScaleUpIgnoresDeletionPods(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{500, 700},
+			levels:   makePodMetricLevels(500, 700),
 
 			targetUtilization:   30,
 			expectedUtilization: 60,
@@ -570,16 +691,37 @@ func TestReplicaCalcScaleUpIgnoresDeletionPods(t *testing.T) {
 	tc.runTest(t)
 }
 
+func TestReplicaCalcScaleUpContainerIgnoresDeletionPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:      2,
+		expectedReplicas:     4,
+		podReadiness:         []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse},
+		podPhase:             []v1.PodPhase{v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodRunning},
+		podDeletionTimestamp: []bool{false, false, true, true},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   makePodMetricLevels(500, 700), // TODO: This test is broken and works only because of missing metrics
+
+			targetUtilization:   30,
+			expectedUtilization: 60,
+			expectedValue:       600,
+		},
+		container: "container1",
+	}
+	tc.runTest(t)
+}
+
 func TestReplicaCalcScaleUpCM(t *testing.T) {
 	tc := replicaCalcTestCase{
 		currentReplicas:  3,
 		expectedReplicas: 4,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{20000, 10000, 30000},
-			targetUtilization:   15000,
-			expectedUtilization: 20000,
-			metricType:          podMetric,
+			name:          "qps",
+			levels:        []int64{20000, 10000, 30000},
+			targetUsage:   15000,
+			expectedUsage: 20000,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -592,11 +734,11 @@ func TestReplicaCalcScaleUpCMUnreadyHotCpuNoLessScale(t *testing.T) {
 		podReadiness:     []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse},
 		podStartTime:     []metav1.Time{coolCPUCreationTime(), coolCPUCreationTime(), hotCPUCreationTime()},
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{50000, 10000, 30000},
-			targetUtilization:   15000,
-			expectedUtilization: 30000,
-			metricType:          podMetric,
+			name:          "qps",
+			levels:        []int64{50000, 10000, 30000},
+			targetUsage:   15000,
+			expectedUsage: 30000,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -609,11 +751,11 @@ func TestReplicaCalcScaleUpCMUnreadyHotCpuScaleWouldScaleDown(t *testing.T) {
 		podReadiness:     []v1.ConditionStatus{v1.ConditionFalse, v1.ConditionTrue, v1.ConditionFalse},
 		podStartTime:     []metav1.Time{hotCPUCreationTime(), coolCPUCreationTime(), hotCPUCreationTime()},
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{50000, 15000, 30000},
-			targetUtilization:   15000,
-			expectedUtilization: 31666,
-			metricType:          podMetric,
+			name:          "qps",
+			levels:        []int64{50000, 15000, 30000},
+			targetUsage:   15000,
+			expectedUsage: 31666,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -624,10 +766,10 @@ func TestReplicaCalcScaleUpCMObject(t *testing.T) {
 		currentReplicas:  3,
 		expectedReplicas: 4,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{20000},
-			targetUtilization:   15000,
-			expectedUtilization: 20000,
+			name:          "qps",
+			levels:        []int64{20000},
+			targetUsage:   15000,
+			expectedUsage: 20000,
 			singleObject: &autoscalingv2.CrossVersionObjectReference{
 				Kind:       "Deployment",
 				APIVersion: "apps/v1",
@@ -643,11 +785,11 @@ func TestReplicaCalcScaleUpCMPerPodObject(t *testing.T) {
 		currentReplicas:  3,
 		expectedReplicas: 4,
 		metric: &metricInfo{
-			metricType:              objectPerPodMetric,
-			name:                    "qps",
-			levels:                  []int64{20000},
-			perPodTargetUtilization: 5000,
-			expectedUtilization:     6667,
+			metricType:        objectPerPodMetric,
+			name:              "qps",
+			levels:            []int64{20000},
+			perPodTargetUsage: 5000,
+			expectedUsage:     6667,
 			singleObject: &autoscalingv2.CrossVersionObjectReference{
 				Kind:       "Deployment",
 				APIVersion: "apps/v1",
@@ -664,10 +806,10 @@ func TestReplicaCalcScaleUpCMObjectIgnoresUnreadyPods(t *testing.T) {
 		expectedReplicas: 5, // If we did not ignore unready pods, we'd expect 15 replicas.
 		podReadiness:     []v1.ConditionStatus{v1.ConditionFalse, v1.ConditionTrue, v1.ConditionFalse},
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{50000},
-			targetUtilization:   10000,
-			expectedUtilization: 50000,
+			name:          "qps",
+			levels:        []int64{50000},
+			targetUsage:   10000,
+			expectedUsage: 50000,
 			singleObject: &autoscalingv2.CrossVersionObjectReference{
 				Kind:       "Deployment",
 				APIVersion: "apps/v1",
@@ -683,12 +825,12 @@ func TestReplicaCalcScaleUpCMExternal(t *testing.T) {
 		currentReplicas:  1,
 		expectedReplicas: 2,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{8600},
-			targetUtilization:   4400,
-			expectedUtilization: 8600,
-			selector:            &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
-			metricType:          podMetric,
+			name:          "qps",
+			levels:        []int64{8600},
+			targetUsage:   4400,
+			expectedUsage: 8600,
+			selector:      &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -700,12 +842,12 @@ func TestReplicaCalcScaleUpCMExternalIgnoresUnreadyPods(t *testing.T) {
 		expectedReplicas: 2, // Would expect 6 if we didn't ignore unready pods
 		podReadiness:     []v1.ConditionStatus{v1.ConditionFalse, v1.ConditionTrue, v1.ConditionFalse},
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{8600},
-			targetUtilization:   4400,
-			expectedUtilization: 8600,
-			selector:            &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
-			metricType:          externalMetric,
+			name:          "qps",
+			levels:        []int64{8600},
+			targetUsage:   4400,
+			expectedUsage: 8600,
+			selector:      &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:    externalMetric,
 		},
 	}
 	tc.runTest(t)
@@ -716,11 +858,11 @@ func TestReplicaCalcScaleUpCMExternalNoLabels(t *testing.T) {
 		currentReplicas:  1,
 		expectedReplicas: 2,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{8600},
-			targetUtilization:   4400,
-			expectedUtilization: 8600,
-			metricType:          podMetric,
+			name:          "qps",
+			levels:        []int64{8600},
+			targetUsage:   4400,
+			expectedUsage: 8600,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -731,12 +873,12 @@ func TestReplicaCalcScaleUpPerPodCMExternal(t *testing.T) {
 		currentReplicas:  3,
 		expectedReplicas: 4,
 		metric: &metricInfo{
-			name:                    "qps",
-			levels:                  []int64{8600},
-			perPodTargetUtilization: 2150,
-			expectedUtilization:     2867,
-			selector:                &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
-			metricType:              externalPerPodMetric,
+			name:              "qps",
+			levels:            []int64{8600},
+			perPodTargetUsage: 2150,
+			expectedUsage:     2867,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:        externalPerPodMetric,
 		},
 	}
 	tc.runTest(t)
@@ -749,7 +891,7 @@ func TestReplicaCalcScaleDown(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 300, 500, 250, 250},
+			levels:   makePodMetricLevels(100, 300, 500, 250, 250),
 
 			targetUtilization:   50,
 			expectedUtilization: 28,
@@ -759,16 +901,34 @@ func TestReplicaCalcScaleDown(t *testing.T) {
 	tc.runTest(t)
 }
 
+func TestReplicaCalcContainerScaleDown(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  5,
+		expectedReplicas: 3,
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 100}, {1000, 300}, {1000, 500}, {1000, 250}, {1000, 250}},
+
+			targetUtilization:   50,
+			expectedUtilization: 28,
+			expectedValue:       280,
+		},
+		container: "container2",
+	}
+	tc.runTest(t)
+}
+
 func TestReplicaCalcScaleDownCM(t *testing.T) {
 	tc := replicaCalcTestCase{
 		currentReplicas:  5,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{12000, 12000, 12000, 12000, 12000},
-			targetUtilization:   20000,
-			expectedUtilization: 12000,
-			metricType:          podMetric,
+			name:          "qps",
+			levels:        []int64{12000, 12000, 12000, 12000, 12000},
+			targetUsage:   20000,
+			expectedUsage: 12000,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -779,10 +939,10 @@ func TestReplicaCalcScaleDownPerPodCMObject(t *testing.T) {
 		currentReplicas:  5,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                    "qps",
-			levels:                  []int64{6000},
-			perPodTargetUtilization: 2000,
-			expectedUtilization:     1200,
+			name:              "qps",
+			levels:            []int64{6000},
+			perPodTargetUsage: 2000,
+			expectedUsage:     1200,
 			singleObject: &autoscalingv2.CrossVersionObjectReference{
 				Kind:       "Deployment",
 				APIVersion: "apps/v1",
@@ -799,10 +959,10 @@ func TestReplicaCalcScaleDownCMObject(t *testing.T) {
 		currentReplicas:  5,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{12000},
-			targetUtilization:   20000,
-			expectedUtilization: 12000,
+			name:          "qps",
+			levels:        []int64{12000},
+			targetUsage:   20000,
+			expectedUsage: 12000,
 			singleObject: &autoscalingv2.CrossVersionObjectReference{
 				Kind:       "Deployment",
 				APIVersion: "apps/v1",
@@ -818,12 +978,12 @@ func TestReplicaCalcScaleDownCMExternal(t *testing.T) {
 		currentReplicas:  5,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{8600},
-			targetUtilization:   14334,
-			expectedUtilization: 8600,
-			selector:            &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
-			metricType:          externalMetric,
+			name:          "qps",
+			levels:        []int64{8600},
+			targetUsage:   14334,
+			expectedUsage: 8600,
+			selector:      &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:    externalMetric,
 		},
 	}
 	tc.runTest(t)
@@ -834,18 +994,18 @@ func TestReplicaCalcScaleDownPerPodCMExternal(t *testing.T) {
 		currentReplicas:  5,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                    "qps",
-			levels:                  []int64{8600},
-			perPodTargetUtilization: 2867,
-			expectedUtilization:     1720,
-			selector:                &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
-			metricType:              externalPerPodMetric,
+			name:              "qps",
+			levels:            []int64{8600},
+			perPodTargetUsage: 2867,
+			expectedUsage:     1720,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:        externalPerPodMetric,
 		},
 	}
 	tc.runTest(t)
 }
 
-func TestReplicaCalcScaleDownIncludeUnreadyPods(t *testing.T) {
+func TestReplicaCalcScaleDownExcludeUnreadyPods(t *testing.T) {
 	tc := replicaCalcTestCase{
 		currentReplicas:  5,
 		expectedReplicas: 2,
@@ -853,12 +1013,31 @@ func TestReplicaCalcScaleDownIncludeUnreadyPods(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 300, 500, 250, 250},
+			levels:   makePodMetricLevels(100, 300, 500, 250, 250),
 
 			targetUtilization:   50,
 			expectedUtilization: 30,
 			expectedValue:       numContainersPerPod * 300,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcScaleDownContainerExcludeUnreadyPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  5,
+		expectedReplicas: 2,
+		podReadiness:     []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 100}, {1000, 300}, {1000, 500}, {1000, 250}, {1000, 250}},
+
+			targetUtilization:   50,
+			expectedUtilization: 30,
+			expectedValue:       300,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -872,12 +1051,32 @@ func TestReplicaCalcScaleDownExcludeUnscheduledPods(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100},
+			levels:   makePodMetricLevels(100),
 
 			targetUtilization:   50,
 			expectedUtilization: 10,
 			expectedValue:       numContainersPerPod * 100,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcScaleDownContainerExcludeUnscheduledPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  5,
+		expectedReplicas: 1,
+		podReadiness:     []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse, v1.ConditionFalse, v1.ConditionFalse},
+		podPhase:         []v1.PodPhase{v1.PodRunning, v1.PodPending, v1.PodPending, v1.PodPending, v1.PodPending},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 100}, {1000, 300}, {1000, 500}, {1000, 250}, {1000, 250}},
+
+			targetUtilization:   50,
+			expectedUtilization: 10,
+			expectedValue:       100,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -890,12 +1089,31 @@ func TestReplicaCalcScaleDownIgnoreHotCpuPods(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 300, 500, 250, 250},
+			levels:   makePodMetricLevels(100, 300, 500, 250, 250),
 
 			targetUtilization:   50,
 			expectedUtilization: 30,
 			expectedValue:       numContainersPerPod * 300,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcScaleDownContainerIgnoreHotCpuPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  5,
+		expectedReplicas: 2,
+		podStartTime:     []metav1.Time{coolCPUCreationTime(), coolCPUCreationTime(), coolCPUCreationTime(), hotCPUCreationTime(), hotCPUCreationTime()},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 100}, {1000, 300}, {1000, 500}, {1000, 1000}, {1000, 1000}},
+
+			targetUtilization:   50,
+			expectedUtilization: 30,
+			expectedValue:       300,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -909,12 +1127,32 @@ func TestReplicaCalcScaleDownIgnoresFailedPods(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 300, 500, 250, 250},
+			levels:   makePodMetricLevels(100, 300, 500, 250, 250),
 
 			targetUtilization:   50,
 			expectedUtilization: 28,
 			expectedValue:       numContainersPerPod * 280,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcScaleDownContainerIgnoresFailedPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  5,
+		expectedReplicas: 3,
+		podReadiness:     []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse},
+		podPhase:         []v1.PodPhase{v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodFailed, v1.PodFailed},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 100}, {1000, 300}, {1000, 500}, {1000, 250}, {1000, 250}}, //TODO: Test is broken
+
+			targetUtilization:   50,
+			expectedUtilization: 28,
+			expectedValue:       280,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -929,12 +1167,34 @@ func TestReplicaCalcScaleDownIgnoresDeletionPods(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 300, 500, 250, 250},
+			levels:   makePodMetricLevels(100, 300, 500, 250, 250),
 
 			targetUtilization:   50,
 			expectedUtilization: 28,
 			expectedValue:       numContainersPerPod * 280,
 		},
+	}
+	tc.runTest(t)
+}
+
+// Regression test for https://github.com/kubernetes/kubernetes/issues/83561
+func TestReplicaCalcScaleDownIgnoresDeletionPods_StillRunning(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:      5,
+		expectedReplicas:     3,
+		podReadiness:         []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse},
+		podPhase:             []v1.PodPhase{v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodRunning, v1.PodRunning},
+		podDeletionTimestamp: []bool{false, false, false, false, false, true, true},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 100}, {1000, 300}, {1000, 500}, {1000, 250}, {1000, 250}},
+
+			targetUtilization:   50,
+			expectedUtilization: 28,
+			expectedValue:       280,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -946,7 +1206,7 @@ func TestReplicaCalcTolerance(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("0.9"), resource.MustParse("1.0"), resource.MustParse("1.1")},
-			levels:   []int64{1010, 1030, 1020},
+			levels:   makePodMetricLevels(1010, 1030, 1020),
 
 			targetUtilization:   100,
 			expectedUtilization: 102,
@@ -961,11 +1221,11 @@ func TestReplicaCalcToleranceCM(t *testing.T) {
 		currentReplicas:  3,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{20000, 21000, 21000},
-			targetUtilization:   20000,
-			expectedUtilization: 20666,
-			metricType:          podMetric,
+			name:          "qps",
+			levels:        []int64{20000, 21000, 21000},
+			targetUsage:   20000,
+			expectedUsage: 20666,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -976,10 +1236,10 @@ func TestReplicaCalcToleranceCMObject(t *testing.T) {
 		currentReplicas:  3,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{20666},
-			targetUtilization:   20000,
-			expectedUtilization: 20666,
+			name:          "qps",
+			levels:        []int64{20666},
+			targetUsage:   20000,
+			expectedUsage: 20666,
 			singleObject: &autoscalingv2.CrossVersionObjectReference{
 				Kind:       "Deployment",
 				APIVersion: "apps/v1",
@@ -995,11 +1255,11 @@ func TestReplicaCalcTolerancePerPodCMObject(t *testing.T) {
 		currentReplicas:  4,
 		expectedReplicas: 4,
 		metric: &metricInfo{
-			metricType:              objectPerPodMetric,
-			name:                    "qps",
-			levels:                  []int64{20166},
-			perPodTargetUtilization: 5000,
-			expectedUtilization:     5042,
+			metricType:        objectPerPodMetric,
+			name:              "qps",
+			levels:            []int64{20166},
+			perPodTargetUsage: 5000,
+			expectedUsage:     5042,
 			singleObject: &autoscalingv2.CrossVersionObjectReference{
 				Kind:       "Deployment",
 				APIVersion: "apps/v1",
@@ -1015,12 +1275,12 @@ func TestReplicaCalcToleranceCMExternal(t *testing.T) {
 		currentReplicas:  3,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                "qps",
-			levels:              []int64{8600},
-			targetUtilization:   8888,
-			expectedUtilization: 8600,
-			selector:            &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
-			metricType:          externalMetric,
+			name:          "qps",
+			levels:        []int64{8600},
+			targetUsage:   8888,
+			expectedUsage: 8600,
+			selector:      &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:    externalMetric,
 		},
 	}
 	tc.runTest(t)
@@ -1031,12 +1291,194 @@ func TestReplicaCalcTolerancePerPodCMExternal(t *testing.T) {
 		currentReplicas:  3,
 		expectedReplicas: 3,
 		metric: &metricInfo{
-			name:                    "qps",
-			levels:                  []int64{8600},
-			perPodTargetUtilization: 2900,
-			expectedUtilization:     2867,
-			selector:                &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
-			metricType:              externalPerPodMetric,
+			name:              "qps",
+			levels:            []int64{8600},
+			perPodTargetUsage: 2900,
+			expectedUsage:     2867,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:        externalPerPodMetric,
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcConfigurableTolerance(t *testing.T) {
+	testCases := []struct {
+		name string
+		replicaCalcTestCase
+	}{
+		{
+			name: "Outside of a 0% tolerance",
+			replicaCalcTestCase: replicaCalcTestCase{
+				tolerances:       &Tolerances{0., 0.},
+				currentReplicas:  3,
+				expectedReplicas: 4,
+				resource: &resourceInfo{
+					name:                v1.ResourceCPU,
+					requests:            []resource.Quantity{resource.MustParse("0.9"), resource.MustParse("1.0"), resource.MustParse("1.1")},
+					levels:              makePodMetricLevels(909, 1010, 1111),
+					targetUtilization:   100,
+					expectedUtilization: 101,
+					expectedValue:       numContainersPerPod * 1010,
+				},
+			},
+		},
+		{
+			name: "Within a 200% scale-up tolerance",
+			replicaCalcTestCase: replicaCalcTestCase{
+				tolerances:       &Tolerances{defaultTestingTolerance, 2.},
+				currentReplicas:  3,
+				expectedReplicas: 3,
+				resource: &resourceInfo{
+					name:                v1.ResourceCPU,
+					requests:            []resource.Quantity{resource.MustParse("0.9"), resource.MustParse("1.0"), resource.MustParse("1.1")},
+					levels:              makePodMetricLevels(1890, 1910, 1900),
+					targetUtilization:   100,
+					expectedUtilization: 190,
+					expectedValue:       numContainersPerPod * 1900,
+				},
+			},
+		},
+		{
+			name: "Outside 8% scale-up tolerance (and superfuous scale-down tolerance)",
+			replicaCalcTestCase: replicaCalcTestCase{
+				tolerances:       &Tolerances{2., .08},
+				currentReplicas:  3,
+				expectedReplicas: 4,
+				resource: &resourceInfo{
+					name:                v1.ResourceCPU,
+					requests:            []resource.Quantity{resource.MustParse("0.9"), resource.MustParse("1.0"), resource.MustParse("1.1")},
+					levels:              makePodMetricLevels(1100, 1080, 1090),
+					targetUtilization:   100,
+					expectedUtilization: 109,
+					expectedValue:       numContainersPerPod * 1090,
+				},
+			},
+		},
+		{
+			name: "Within a 36% scale-down tolerance",
+			replicaCalcTestCase: replicaCalcTestCase{
+				tolerances:       &Tolerances{.36, defaultTestingTolerance},
+				currentReplicas:  3,
+				expectedReplicas: 3,
+				resource: &resourceInfo{
+					name:                v1.ResourceCPU,
+					requests:            []resource.Quantity{resource.MustParse("0.9"), resource.MustParse("1.0"), resource.MustParse("1.1")},
+					levels:              makePodMetricLevels(660, 640, 650),
+					targetUtilization:   100,
+					expectedUtilization: 65,
+					expectedValue:       numContainersPerPod * 650,
+				},
+			},
+		},
+		{
+			name: "Outside a 34% scale-down tolerance",
+			replicaCalcTestCase: replicaCalcTestCase{
+				tolerances:       &Tolerances{.34, defaultTestingTolerance},
+				currentReplicas:  3,
+				expectedReplicas: 2,
+				resource: &resourceInfo{
+					name:                v1.ResourceCPU,
+					requests:            []resource.Quantity{resource.MustParse("0.9"), resource.MustParse("1.0"), resource.MustParse("1.1")},
+					levels:              makePodMetricLevels(660, 640, 650),
+					targetUtilization:   100,
+					expectedUtilization: 65,
+					expectedValue:       numContainersPerPod * 650,
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.runTest)
+	}
+}
+
+func TestReplicaCalcConfigurableToleranceCM(t *testing.T) {
+	tc := replicaCalcTestCase{
+		tolerances:       &Tolerances{defaultTestingTolerance, .01},
+		currentReplicas:  3,
+		expectedReplicas: 4,
+		metric: &metricInfo{
+			name:          "qps",
+			levels:        []int64{20000, 21000, 21000},
+			targetUsage:   20000,
+			expectedUsage: 20666,
+			metricType:    podMetric,
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcConfigurableToleranceCMObject(t *testing.T) {
+	tc := replicaCalcTestCase{
+		tolerances:       &Tolerances{defaultTestingTolerance, .01},
+		currentReplicas:  3,
+		expectedReplicas: 4,
+		metric: &metricInfo{
+			name:          "qps",
+			levels:        []int64{20666},
+			targetUsage:   20000,
+			expectedUsage: 20666,
+			singleObject: &autoscalingv2.CrossVersionObjectReference{
+				Kind:       "Deployment",
+				APIVersion: "apps/v1",
+				Name:       "some-deployment",
+			},
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcConfigurableTolerancePerPodCMObject(t *testing.T) {
+	tc := replicaCalcTestCase{
+		tolerances:       &Tolerances{defaultTestingTolerance, .01},
+		currentReplicas:  4,
+		expectedReplicas: 5,
+		metric: &metricInfo{
+			metricType:        objectPerPodMetric,
+			name:              "qps",
+			levels:            []int64{20208},
+			perPodTargetUsage: 5000,
+			expectedUsage:     5052,
+			singleObject: &autoscalingv2.CrossVersionObjectReference{
+				Kind:       "Deployment",
+				APIVersion: "apps/v1",
+				Name:       "some-deployment",
+			},
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcConfigurableToleranceCMExternal(t *testing.T) {
+	tc := replicaCalcTestCase{
+		tolerances:       &Tolerances{defaultTestingTolerance, .01},
+		currentReplicas:  3,
+		expectedReplicas: 4,
+		metric: &metricInfo{
+			name:          "qps",
+			levels:        []int64{8900},
+			targetUsage:   8800,
+			expectedUsage: 8900,
+			selector:      &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:    externalMetric,
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcConfigurableTolerancePerPodCMExternal(t *testing.T) {
+	tc := replicaCalcTestCase{
+		tolerances:       &Tolerances{defaultTestingTolerance, .01},
+		currentReplicas:  3,
+		expectedReplicas: 4,
+		metric: &metricInfo{
+			name:              "qps",
+			levels:            []int64{8600},
+			perPodTargetUsage: 2800,
+			expectedUsage:     2867,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"label": "value"}},
+			metricType:        externalPerPodMetric,
 		},
 	}
 	tc.runTest(t)
@@ -1049,7 +1491,7 @@ func TestReplicaCalcSuperfluousMetrics(t *testing.T) {
 		resource: &resourceInfo{
 			name:                v1.ResourceCPU,
 			requests:            []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:              []int64{4000, 9500, 3000, 7000, 3200, 2000},
+			levels:              makePodMetricLevels(4000, 9500, 3000, 7000, 3200, 2000),
 			targetUtilization:   100,
 			expectedUtilization: 587,
 			expectedValue:       numContainersPerPod * 5875,
@@ -1065,7 +1507,7 @@ func TestReplicaCalcMissingMetrics(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{400, 95},
+			levels:   makePodMetricLevels(400, 95),
 
 			targetUtilization:   100,
 			expectedUtilization: 24,
@@ -1082,7 +1524,7 @@ func TestReplicaCalcEmptyMetrics(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{},
+			levels:   makePodMetricLevels(),
 
 			targetUtilization: 100,
 		},
@@ -1097,9 +1539,24 @@ func TestReplicaCalcEmptyCPURequest(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{},
-			levels:   []int64{200},
+			levels:   makePodMetricLevels(200),
 
 			targetUtilization: 100,
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestPlainMetricReplicaCalcMissingMetricsNoChangeEq(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  5,
+		expectedReplicas: 5,
+		metric: &metricInfo{
+			name:          "qps",
+			levels:        []int64{20000, 19000, 21000},
+			targetUsage:   20000,
+			expectedUsage: 20000,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -1112,7 +1569,7 @@ func TestReplicaCalcMissingMetricsNoChangeEq(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{1000},
+			levels:   makePodMetricLevels(1000),
 
 			targetUtilization:   100,
 			expectedUtilization: 100,
@@ -1129,7 +1586,7 @@ func TestReplicaCalcMissingMetricsNoChangeGt(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{1900},
+			levels:   makePodMetricLevels(1900),
 
 			targetUtilization:   100,
 			expectedUtilization: 190,
@@ -1146,7 +1603,7 @@ func TestReplicaCalcMissingMetricsNoChangeLt(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{600},
+			levels:   makePodMetricLevels(600),
 
 			targetUtilization:   100,
 			expectedUtilization: 60,
@@ -1164,7 +1621,7 @@ func TestReplicaCalcMissingMetricsUnreadyChange(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 450},
+			levels:   makePodMetricLevels(100, 450),
 
 			targetUtilization:   50,
 			expectedUtilization: 45,
@@ -1182,7 +1639,7 @@ func TestReplicaCalcMissingMetricsHotCpuNoChange(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 450},
+			levels:   makePodMetricLevels(100, 450),
 
 			targetUtilization:   50,
 			expectedUtilization: 45,
@@ -1200,7 +1657,7 @@ func TestReplicaCalcMissingMetricsUnreadyScaleUp(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 2000},
+			levels:   makePodMetricLevels(100, 2000),
 
 			targetUtilization:   50,
 			expectedUtilization: 200,
@@ -1219,7 +1676,7 @@ func TestReplicaCalcMissingMetricsHotCpuScaleUp(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 2000},
+			levels:   makePodMetricLevels(100, 2000),
 
 			targetUtilization:   50,
 			expectedUtilization: 200,
@@ -1237,10 +1694,28 @@ func TestReplicaCalcMissingMetricsUnreadyScaleDown(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 100, 100},
+			levels:   makePodMetricLevels(100, 100, 100),
 
 			targetUtilization:   50,
 			expectedUtilization: 10,
+			expectedValue:       numContainersPerPod * 100,
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcMissingMetricsScaleDownTargetOver100(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  4,
+		expectedReplicas: 2,
+		podReadiness:     []v1.ConditionStatus{v1.ConditionFalse, v1.ConditionTrue, v1.ConditionTrue, v1.ConditionTrue},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("2.0"), resource.MustParse("2.0")},
+			levels:   makePodMetricLevels(200, 100, 100),
+
+			targetUtilization:   300,
+			expectedUtilization: 6,
 			expectedValue:       numContainersPerPod * 100,
 		},
 	}
@@ -1255,11 +1730,27 @@ func TestReplicaCalcDuringRollingUpdateWithMaxSurge(t *testing.T) {
 		resource: &resourceInfo{
 			name:     v1.ResourceCPU,
 			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
-			levels:   []int64{100, 100},
+			levels:   makePodMetricLevels(100, 100),
 
 			targetUtilization:   50,
 			expectedUtilization: 10,
 			expectedValue:       numContainersPerPod * 100,
+		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcDuringRollingUpdateWithMaxSurgeCM(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  2,
+		expectedReplicas: 2,
+		podPhase:         []v1.PodPhase{v1.PodRunning, v1.PodRunning, v1.PodRunning},
+		metric: &metricInfo{
+			name:          "qps",
+			levels:        []int64{10000, 10000},
+			targetUsage:   17000,
+			expectedUsage: 10000,
+			metricType:    podMetric,
 		},
 	}
 	tc.runTest(t)
@@ -1294,18 +1785,18 @@ func TestReplicaCalcComputedToleranceAlgImplementation(t *testing.T) {
 		expectedReplicas: finalPods,
 		resource: &resourceInfo{
 			name: v1.ResourceCPU,
-			levels: []int64{
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-				totalUsedCPUOfAllPods / 10,
-			},
+			levels: makePodMetricLevels(
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+				totalUsedCPUOfAllPods/10,
+			),
 			requests: []resource.Quantity{
 				resource.MustParse(fmt.Sprint(perPodRequested+100) + "m"),
 				resource.MustParse(fmt.Sprint(perPodRequested-100) + "m"),
@@ -1344,21 +1835,22 @@ func TestGroupPods(t *testing.T) {
 		metrics             metricsclient.PodMetricsInfo
 		resource            v1.ResourceName
 		expectReadyPodCount int
-		expectIgnoredPods   sets.String
-		expectMissingPods   sets.String
+		expectUnreadyPods   sets.Set[string]
+		expectMissingPods   sets.Set[string]
+		expectIgnoredPods   sets.Set[string]
 	}{
 		{
-			"void",
-			[]*v1.Pod{},
-			metricsclient.PodMetricsInfo{},
-			v1.ResourceCPU,
-			0,
-			sets.NewString(),
-			sets.NewString(),
-		},
-		{
-			"count in a ready pod - memory",
-			[]*v1.Pod{
+			name:                "void",
+			pods:                []*v1.Pod{},
+			metrics:             metricsclient.PodMetricsInfo{},
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 0,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "count in a ready pod - memory",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "bentham",
@@ -1368,17 +1860,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"bentham": metricsclient.PodMetric{Value: 1, Timestamp: time.Now(), Window: time.Minute},
 			},
-			v1.ResourceMemory,
-			1,
-			sets.NewString(),
-			sets.NewString(),
-		},
-		{
-			"ignore a pod without ready condition - CPU",
-			[]*v1.Pod{
+			resource:            v1.ResourceMemory,
+			expectReadyPodCount: 1,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "unready a pod without ready condition - CPU",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "lucretius",
@@ -1391,17 +1883,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"lucretius": metricsclient.PodMetric{Value: 1},
 			},
-			v1.ResourceCPU,
-			0,
-			sets.NewString("lucretius"),
-			sets.NewString(),
-		},
-		{
-			"count in a ready pod with fresh metrics during initialization period - CPU",
-			[]*v1.Pod{
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 0,
+			expectUnreadyPods:   sets.New[string]("lucretius"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "count in a ready pod with fresh metrics during initialization period - CPU",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "bentham",
@@ -1421,17 +1913,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"bentham": metricsclient.PodMetric{Value: 1, Timestamp: time.Now(), Window: 30 * time.Second},
 			},
-			v1.ResourceCPU,
-			1,
-			sets.NewString(),
-			sets.NewString(),
-		},
-		{
-			"ignore a ready pod without fresh metrics during initialization period - CPU",
-			[]*v1.Pod{
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 1,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "unready a ready pod without fresh metrics during initialization period - CPU",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "bentham",
@@ -1451,17 +1943,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"bentham": metricsclient.PodMetric{Value: 1, Timestamp: time.Now(), Window: 60 * time.Second},
 			},
-			v1.ResourceCPU,
-			0,
-			sets.NewString("bentham"),
-			sets.NewString(),
-		},
-		{
-			"ignore an unready pod during initialization period - CPU",
-			[]*v1.Pod{
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 0,
+			expectUnreadyPods:   sets.New[string]("bentham"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "unready an unready pod during initialization period - CPU",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "lucretius",
@@ -1481,17 +1973,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"lucretius": metricsclient.PodMetric{Value: 1},
 			},
-			v1.ResourceCPU,
-			0,
-			sets.NewString("lucretius"),
-			sets.NewString(),
-		},
-		{
-			"count in a ready pod without fresh metrics after initialization period - CPU",
-			[]*v1.Pod{
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 0,
+			expectUnreadyPods:   sets.New[string]("lucretius"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "count in a ready pod without fresh metrics after initialization period - CPU",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "bentham",
@@ -1511,18 +2003,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"bentham": metricsclient.PodMetric{Value: 1, Timestamp: time.Now().Add(-2 * time.Minute), Window: time.Minute},
 			},
-			v1.ResourceCPU,
-			1,
-			sets.NewString(),
-			sets.NewString(),
-		},
-
-		{
-			"count in an unready pod that was ready after initialization period - CPU",
-			[]*v1.Pod{
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 1,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "count in an unready pod that was ready after initialization period - CPU",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "lucretius",
@@ -1542,17 +2033,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"lucretius": metricsclient.PodMetric{Value: 1},
 			},
-			v1.ResourceCPU,
-			1,
-			sets.NewString(),
-			sets.NewString(),
-		},
-		{
-			"ignore pod that has never been ready after initialization period - CPU",
-			[]*v1.Pod{
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 1,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "unready pod that has never been ready after initialization period - CPU",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "lucretius",
@@ -1572,17 +2063,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"lucretius": metricsclient.PodMetric{Value: 1},
 			},
-			v1.ResourceCPU,
-			1,
-			sets.NewString(),
-			sets.NewString(),
-		},
-		{
-			"a missing pod",
-			[]*v1.Pod{
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 1,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "a missing pod",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "epicurus",
@@ -1595,15 +2086,15 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{},
-			v1.ResourceCPU,
-			0,
-			sets.NewString(),
-			sets.NewString("epicurus"),
-		},
-		{
-			"several pods",
-			[]*v1.Pod{
+			metrics:             metricsclient.PodMetricsInfo{},
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 0,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string]("epicurus"),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "several pods",
+			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "lucretius",
@@ -1645,17 +2136,17 @@ func TestGroupPods(t *testing.T) {
 					},
 				},
 			},
-			metricsclient.PodMetricsInfo{
+			metrics: metricsclient.PodMetricsInfo{
 				"lucretius": metricsclient.PodMetric{Value: 1},
 				"niccolo":   metricsclient.PodMetric{Value: 1},
 			},
-			v1.ResourceCPU,
-			1,
-			sets.NewString("lucretius"),
-			sets.NewString("epicurus"),
-		},
-		{
-			name: "pending pods are ignored",
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 1,
+			expectUnreadyPods:   sets.New[string]("lucretius"),
+			expectMissingPods:   sets.New[string]("epicurus"),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "pending pods are unreadied",
 			pods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1669,24 +2160,176 @@ func TestGroupPods(t *testing.T) {
 			metrics:             metricsclient.PodMetricsInfo{},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectIgnoredPods:   sets.NewString("unscheduled"),
-			expectMissingPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string]("unscheduled"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
+		}, {
+			name: "ignore pods with deletion timestamps",
+			pods: []*v1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "deleted",
+						DeletionTimestamp: &metav1.Time{Time: time.Unix(1, 0)},
+					},
+					Status: v1.PodStatus{
+						Phase: v1.PodPending,
+					},
+				},
+			},
+			metrics: metricsclient.PodMetricsInfo{
+				"deleted": metricsclient.PodMetric{Value: 1},
+			},
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 0,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string]("deleted"),
+		}, {
+			name: "ignore pods in a failed state",
+			pods: []*v1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "failed",
+					},
+					Status: v1.PodStatus{
+						Phase: v1.PodFailed,
+					},
+				},
+			},
+			metrics: metricsclient.PodMetricsInfo{
+				"failed": metricsclient.PodMetric{Value: 1},
+			},
+			resource:            v1.ResourceCPU,
+			expectReadyPodCount: 0,
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string]("failed"),
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			readyPodCount, ignoredPods, missingPods := groupPods(tc.pods, tc.metrics, tc.resource, defaultTestingCPUInitializationPeriod, defaultTestingDelayOfInitialReadinessStatus)
+			readyPodCount, unreadyPods, missingPods, ignoredPods := groupPods(tc.pods, tc.metrics, tc.resource, defaultTestingCPUInitializationPeriod, defaultTestingDelayOfInitialReadinessStatus)
 			if readyPodCount != tc.expectReadyPodCount {
 				t.Errorf("%s got readyPodCount %d, expected %d", tc.name, readyPodCount, tc.expectReadyPodCount)
 			}
-			if !ignoredPods.Equal(tc.expectIgnoredPods) {
-				t.Errorf("%s got unreadyPods %v, expected %v", tc.name, ignoredPods, tc.expectIgnoredPods)
+			if !unreadyPods.Equal(tc.expectUnreadyPods) {
+				t.Errorf("%s got unreadyPods %v, expected %v", tc.name, unreadyPods, tc.expectUnreadyPods)
 			}
 			if !missingPods.Equal(tc.expectMissingPods) {
 				t.Errorf("%s got missingPods %v, expected %v", tc.name, missingPods, tc.expectMissingPods)
+			}
+			if !ignoredPods.Equal(tc.expectIgnoredPods) {
+				t.Errorf("%s got ignoredPods %v, expected %v", tc.name, ignoredPods, tc.expectIgnoredPods)
 			}
 		})
 	}
 }
 
-// TODO: add more tests
+func TestCalculatePodRequests(t *testing.T) {
+	containerRestartPolicyAlways := v1.ContainerRestartPolicyAlways
+	testPod := "test-pod"
+
+	tests := []struct {
+		name             string
+		pods             []*v1.Pod
+		container        string
+		resource         v1.ResourceName
+		expectedRequests map[string]int64
+		expectedError    error
+	}{
+		{
+			name:             "void",
+			pods:             []*v1.Pod{},
+			container:        "",
+			resource:         v1.ResourceCPU,
+			expectedRequests: map[string]int64{},
+			expectedError:    nil,
+		},
+		{
+			name: "pod with regular containers",
+			pods: []*v1.Pod{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testPod,
+					Namespace: testNamespace,
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{Name: "container1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI)}}},
+						{Name: "container2", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: *resource.NewMilliQuantity(50, resource.DecimalSI)}}},
+					},
+				},
+			}},
+			container:        "",
+			resource:         v1.ResourceCPU,
+			expectedRequests: map[string]int64{testPod: 150},
+			expectedError:    nil,
+		},
+		{
+			name: "calculate requests with special container",
+			pods: []*v1.Pod{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testPod,
+					Namespace: testNamespace,
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{Name: "container1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI)}}},
+						{Name: "container2", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: *resource.NewMilliQuantity(50, resource.DecimalSI)}}},
+					},
+				},
+			}},
+			container:        "container1",
+			resource:         v1.ResourceCPU,
+			expectedRequests: map[string]int64{testPod: 100},
+			expectedError:    nil,
+		},
+		{
+			name: "container missing requests",
+			pods: []*v1.Pod{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testPod,
+					Namespace: testNamespace,
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{Name: "container1"},
+					},
+				},
+			}},
+			container:        "",
+			resource:         v1.ResourceCPU,
+			expectedRequests: nil,
+			expectedError:    fmt.Errorf("missing request for %s in container %s of Pod %s", v1.ResourceCPU, "container1", testPod),
+		},
+		{
+			name: "pod with restartable init containers",
+			pods: []*v1.Pod{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testPod,
+					Namespace: testNamespace,
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{Name: "container1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI)}}},
+					},
+					InitContainers: []v1.Container{
+						{Name: "init-container1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: *resource.NewMilliQuantity(20, resource.DecimalSI)}}},
+						{Name: "restartable-container1", RestartPolicy: &containerRestartPolicyAlways, Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: *resource.NewMilliQuantity(50, resource.DecimalSI)}}},
+					},
+				},
+			}},
+			container:        "",
+			resource:         v1.ResourceCPU,
+			expectedRequests: map[string]int64{testPod: 150},
+			expectedError:    nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			requests, err := calculatePodRequests(tc.pods, tc.container, tc.resource)
+			assert.Equal(t, tc.expectedRequests, requests, "requests should be as expected")
+			assert.Equal(t, tc.expectedError, err, "error should be as expected")
+		})
+	}
+}

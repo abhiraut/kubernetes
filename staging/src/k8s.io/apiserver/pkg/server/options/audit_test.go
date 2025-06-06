@@ -19,38 +19,29 @@ package options
 import (
 	stdjson "encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
-	"k8s.io/apiserver/pkg/features"
-	"k8s.io/apiserver/pkg/server"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes/fake"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd/api/v1"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/natefinch/lumberjack.v2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
+	"k8s.io/apiserver/pkg/server"
+	v1 "k8s.io/client-go/tools/clientcmd/api/v1"
 )
 
 func TestAuditValidOptions(t *testing.T) {
+	tmpDir := t.TempDir()
+	auditPath := filepath.Join(tmpDir, "audit")
+
 	webhookConfig := makeTmpWebhookConfig(t)
 	defer os.Remove(webhookConfig)
 
 	policy := makeTmpPolicy(t)
 	defer os.Remove(policy)
-
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.DynamicAuditing, true)()
-
-	clientConfig := &restclient.Config{}
-	informerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
-	processInfo := &ProcessInfo{"test", "test"}
 
 	testCases := []struct {
 		name     string
@@ -63,7 +54,25 @@ func TestAuditValidOptions(t *testing.T) {
 		name: "default log",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.LogOptions.Path = "/audit"
+			o.LogOptions.Path = auditPath
+			o.PolicyFile = policy
+			return o
+		},
+		expected: "ignoreErrors<log>",
+	}, {
+		name: "stdout log",
+		options: func() *AuditOptions {
+			o := NewAuditOptions()
+			o.LogOptions.Path = "-"
+			o.PolicyFile = policy
+			return o
+		},
+		expected: "ignoreErrors<log>",
+	}, {
+		name: "create audit log path dir",
+		options: func() *AuditOptions {
+			o := NewAuditOptions()
+			o.LogOptions.Path = filepath.Join(tmpDir, "non-existing-dir1", "non-existing-dir2", "audit")
 			o.PolicyFile = policy
 			return o
 		},
@@ -72,7 +81,7 @@ func TestAuditValidOptions(t *testing.T) {
 		name: "default log no policy",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.LogOptions.Path = "/audit"
+			o.LogOptions.Path = auditPath
 			return o
 		},
 		expected: "",
@@ -107,7 +116,7 @@ func TestAuditValidOptions(t *testing.T) {
 		name: "default union",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.LogOptions.Path = "/audit"
+			o.LogOptions.Path = auditPath
 			o.WebhookOptions.ConfigFile = webhookConfig
 			o.PolicyFile = policy
 			return o
@@ -118,7 +127,7 @@ func TestAuditValidOptions(t *testing.T) {
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
 			o.LogOptions.BatchOptions.Mode = ModeBatch
-			o.LogOptions.Path = "/audit"
+			o.LogOptions.Path = auditPath
 			o.WebhookOptions.BatchOptions.Mode = ModeBlocking
 			o.WebhookOptions.ConfigFile = webhookConfig
 			o.PolicyFile = policy
@@ -135,56 +144,6 @@ func TestAuditValidOptions(t *testing.T) {
 			return o
 		},
 		expected: "truncate<buffered<webhook>>",
-	}, {
-		name: "dynamic",
-		options: func() *AuditOptions {
-			o := NewAuditOptions()
-			o.DynamicOptions.Enabled = true
-			return o
-		},
-		expected: "dynamic[]",
-	}, {
-		name: "dynamic with truncating",
-		options: func() *AuditOptions {
-			o := NewAuditOptions()
-			o.DynamicOptions.Enabled = true
-			o.WebhookOptions.TruncateOptions.Enabled = true
-			return o
-		},
-		expected: "truncate<dynamic[]>",
-	}, {
-		name: "dynamic with log",
-		options: func() *AuditOptions {
-			o := NewAuditOptions()
-			o.DynamicOptions.Enabled = true
-			o.LogOptions.Path = "/audit"
-			o.PolicyFile = policy
-			return o
-		},
-		expected: "union[enforced<ignoreErrors<log>>,dynamic[]]",
-	}, {
-		name: "dynamic with truncating and webhook",
-		options: func() *AuditOptions {
-			o := NewAuditOptions()
-			o.DynamicOptions.Enabled = true
-			o.WebhookOptions.TruncateOptions.Enabled = true
-			o.WebhookOptions.ConfigFile = webhookConfig
-			o.PolicyFile = policy
-			return o
-		},
-		expected: "truncate<union[enforced<buffered<webhook>>,dynamic[]]>",
-	}, {
-		name: "dynamic with truncating and webhook and log",
-		options: func() *AuditOptions {
-			o := NewAuditOptions()
-			o.DynamicOptions.Enabled = true
-			o.WebhookOptions.TruncateOptions.Enabled = true
-			o.WebhookOptions.ConfigFile = webhookConfig
-			o.PolicyFile = policy
-			o.LogOptions.Path = "/audit"
-			return o
-		},
-		expected: "union[enforced<ignoreErrors<log>>,truncate<union[enforced<buffered<webhook>>,dynamic[]]>]",
 	},
 	}
 	for _, tc := range testCases {
@@ -200,17 +159,36 @@ func TestAuditValidOptions(t *testing.T) {
 
 			assert.Empty(t, options.Validate(), "Options should be valid.")
 			config := &server.Config{}
-			require.NoError(t, options.ApplyTo(config, clientConfig, informerFactory, processInfo, nil))
+			require.NoError(t, options.ApplyTo(config))
 			if tc.expected == "" {
 				assert.Nil(t, config.AuditBackend)
 			} else {
 				assert.Equal(t, tc.expected, fmt.Sprintf("%s", config.AuditBackend))
+			}
+
+			w, err := options.LogOptions.getWriter()
+			require.NoError(t, err, "Writer creation should not fail.")
+
+			// Don't check writer if logging is disabled.
+			if w == nil {
+				return
+			}
+
+			if options.LogOptions.Path == "-" {
+				assert.Equal(t, os.Stdout, w)
+				assert.NoFileExists(t, options.LogOptions.Path)
+			} else {
+				assert.IsType(t, (*lumberjack.Logger)(nil), w)
+				assert.FileExists(t, options.LogOptions.Path)
 			}
 		})
 	}
 }
 
 func TestAuditInvalidOptions(t *testing.T) {
+	tmpDir := t.TempDir()
+	auditPath := filepath.Join(tmpDir, "audit")
+
 	testCases := []struct {
 		name    string
 		options func() *AuditOptions
@@ -218,7 +196,7 @@ func TestAuditInvalidOptions(t *testing.T) {
 		name: "invalid log format",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.LogOptions.Path = "/audit"
+			o.LogOptions.Path = auditPath
 			o.LogOptions.Format = "foo"
 			return o
 		},
@@ -226,7 +204,7 @@ func TestAuditInvalidOptions(t *testing.T) {
 		name: "invalid log mode",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.LogOptions.Path = "/audit"
+			o.LogOptions.Path = auditPath
 			o.LogOptions.BatchOptions.Mode = "foo"
 			return o
 		},
@@ -234,7 +212,7 @@ func TestAuditInvalidOptions(t *testing.T) {
 		name: "invalid log buffer size",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.LogOptions.Path = "/audit"
+			o.LogOptions.Path = auditPath
 			o.LogOptions.BatchOptions.Mode = "batch"
 			o.LogOptions.BatchOptions.BatchConfig.BufferSize = -3
 			return o
@@ -243,7 +221,7 @@ func TestAuditInvalidOptions(t *testing.T) {
 		name: "invalid webhook mode",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.WebhookOptions.ConfigFile = "/audit"
+			o.WebhookOptions.ConfigFile = auditPath
 			o.WebhookOptions.BatchOptions.Mode = "foo"
 			return o
 		},
@@ -251,7 +229,7 @@ func TestAuditInvalidOptions(t *testing.T) {
 		name: "invalid webhook buffer throttle qps",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.WebhookOptions.ConfigFile = "/audit"
+			o.WebhookOptions.ConfigFile = auditPath
 			o.WebhookOptions.BatchOptions.Mode = "batch"
 			o.WebhookOptions.BatchOptions.BatchConfig.ThrottleQPS = -1
 			return o
@@ -260,7 +238,7 @@ func TestAuditInvalidOptions(t *testing.T) {
 		name: "invalid webhook truncate max event size",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.WebhookOptions.ConfigFile = "/audit"
+			o.WebhookOptions.ConfigFile = auditPath
 			o.WebhookOptions.TruncateOptions.Enabled = true
 			o.WebhookOptions.TruncateOptions.TruncateConfig.MaxEventSize = -1
 			return o
@@ -269,17 +247,10 @@ func TestAuditInvalidOptions(t *testing.T) {
 		name: "invalid webhook truncate max batch size",
 		options: func() *AuditOptions {
 			o := NewAuditOptions()
-			o.WebhookOptions.ConfigFile = "/audit"
+			o.WebhookOptions.ConfigFile = auditPath
 			o.WebhookOptions.TruncateOptions.Enabled = true
 			o.WebhookOptions.TruncateOptions.TruncateConfig.MaxEventSize = 2
 			o.WebhookOptions.TruncateOptions.TruncateConfig.MaxBatchSize = 1
-			return o
-		},
-	}, {
-		name: "invalid dynamic flag group",
-		options: func() *AuditOptions {
-			o := NewAuditOptions()
-			o.DynamicOptions.Enabled = true
 			return o
 		},
 	},
@@ -299,7 +270,7 @@ func makeTmpWebhookConfig(t *testing.T) string {
 			{Cluster: v1.Cluster{Server: "localhost", InsecureSkipTLSVerify: true}},
 		},
 	}
-	f, err := ioutil.TempFile("", "k8s_audit_webhook_test_")
+	f, err := os.CreateTemp("", "k8s_audit_webhook_test_")
 	require.NoError(t, err, "creating temp file")
 	require.NoError(t, stdjson.NewEncoder(f).Encode(config), "writing webhook kubeconfig")
 	require.NoError(t, f.Close())
@@ -317,7 +288,7 @@ func makeTmpPolicy(t *testing.T) string {
 			},
 		},
 	}
-	f, err := ioutil.TempFile("", "k8s_audit_policy_test_")
+	f, err := os.CreateTemp("", "k8s_audit_policy_test_")
 	require.NoError(t, err, "creating temp file")
 	require.NoError(t, stdjson.NewEncoder(f).Encode(pol), "writing policy file")
 	require.NoError(t, f.Close())

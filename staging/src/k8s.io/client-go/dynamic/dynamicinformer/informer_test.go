@@ -21,12 +21,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/tools/cache"
@@ -37,6 +38,7 @@ type triggerFunc func(gvr schema.GroupVersionResource, ns string, fakeClient *fa
 func triggerFactory(t *testing.T) triggerFunc {
 	return func(gvr schema.GroupVersionResource, ns string, fakeClient *fake.FakeDynamicClient, _ *unstructured.Unstructured) *unstructured.Unstructured {
 		testObject := newUnstructured("apps/v1", "Deployment", "ns-foo", "name-foo")
+		testObject.SetLabels(map[string]string{"environment": "test"})
 		createdObj, err := fakeClient.Resource(gvr).Namespace(ns).Create(context.TODO(), testObject, metav1.CreateOptions{})
 		if err != nil {
 			t.Error(err)
@@ -55,13 +57,14 @@ func handler(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandle
 
 func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 	scenarios := []struct {
-		name        string
-		existingObj *unstructured.Unstructured
-		gvr         schema.GroupVersionResource
-		informNS    string
-		ns          string
-		trigger     func(gvr schema.GroupVersionResource, ns string, fakeClient *fake.FakeDynamicClient, testObject *unstructured.Unstructured) *unstructured.Unstructured
-		handler     func(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs
+		name             string
+		existingObj      *unstructured.Unstructured
+		gvr              schema.GroupVersionResource
+		informNS         string
+		ns               string
+		trigger          func(gvr schema.GroupVersionResource, ns string, fakeClient *fake.FakeDynamicClient, testObject *unstructured.Unstructured) *unstructured.Unstructured
+		handler          func(rcvCh chan<- *unstructured.Unstructured) *cache.ResourceEventHandlerFuncs
+		tweakListOptions dynamicinformer.TweakListOptionsFunc
 	}{
 		// scenario 1
 		{
@@ -81,6 +84,50 @@ func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 			trigger:  triggerFactory(t),
 			handler:  handler,
 		},
+		{
+			name:     "tweak options: test adding an object not matching field selector should not trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.FieldSelector = "metadata.name=name-bar"
+			},
+		},
+		{
+			name:     "tweak options: test adding an object matching field selector should trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.FieldSelector = "metadata.name=name-foo"
+			},
+		},
+		{
+			name:     "tweak options: test adding an object not matching label selector should not trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.LabelSelector = "environment=production"
+			},
+		},
+		{
+			name:     "tweak options: test adding an object matching label selector should trigger AddFunc",
+			informNS: "ns-foo",
+			ns:       "ns-foo",
+			gvr:      schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			trigger:  triggerFactory(t),
+			handler:  handler,
+			tweakListOptions: func(opts *metav1.ListOptions) {
+				opts.LabelSelector = "environment=test"
+			},
+		},
 	}
 
 	for _, ts := range scenarios {
@@ -95,7 +142,12 @@ func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 			if ts.existingObj != nil {
 				objs = append(objs, ts.existingObj)
 			}
-			fakeClient := fake.NewSimpleDynamicClient(scheme, objs...)
+			// don't adjust the scheme to include deploymentlist. This is testing whether an informer can be created against using
+			// a client that doesn't have a type registered in the scheme.
+			gvrToListKind := map[schema.GroupVersionResource]string{
+				{Group: "apps", Version: "v1", Resource: "deployments"}: "DeploymentList",
+			}
+			fakeClient := fake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind, objs...)
 			target := dynamicinformer.NewFilteredDynamicSharedInformerFactory(fakeClient, 0, ts.informNS, nil)
 
 			// act
@@ -113,7 +165,7 @@ func TestFilteredDynamicSharedInformerFactory(t *testing.T) {
 					t.Errorf("informer received an object for namespace %s when watching namespace %s", ts.ns, ts.informNS)
 				}
 				if !equality.Semantic.DeepEqual(testObject, objFromInformer) {
-					t.Fatalf("%v", diff.ObjectDiff(testObject, objFromInformer))
+					t.Fatalf("%v", cmp.Diff(testObject, objFromInformer))
 				}
 			case <-ctx.Done():
 				if ts.ns == ts.informNS {
@@ -214,7 +266,12 @@ func TestDynamicSharedInformerFactory(t *testing.T) {
 			if ts.existingObj != nil {
 				objs = append(objs, ts.existingObj)
 			}
-			fakeClient := fake.NewSimpleDynamicClient(scheme, objs...)
+			// don't adjust the scheme to include deploymentlist. This is testing whether an informer can be created against using
+			// a client that doesn't have a type registered in the scheme.
+			gvrToListKind := map[schema.GroupVersionResource]string{
+				{Group: "extensions", Version: "v1beta1", Resource: "deployments"}: "DeploymentList",
+			}
+			fakeClient := fake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind, objs...)
 			target := dynamicinformer.NewDynamicSharedInformerFactory(fakeClient, 0)
 
 			// act
@@ -229,7 +286,7 @@ func TestDynamicSharedInformerFactory(t *testing.T) {
 			select {
 			case objFromInformer := <-informerReciveObjectCh:
 				if !equality.Semantic.DeepEqual(testObject, objFromInformer) {
-					t.Fatalf("%v", diff.ObjectDiff(testObject, objFromInformer))
+					t.Fatalf("%v", cmp.Diff(testObject, objFromInformer))
 				}
 			case <-ctx.Done():
 				t.Errorf("tested informer haven't received an object, waited %v", timeout)

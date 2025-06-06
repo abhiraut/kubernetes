@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -19,10 +20,11 @@ limitations under the License.
 package util
 
 import (
-	"github.com/pkg/errors"
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 // Chroot chroot()s to the new path.

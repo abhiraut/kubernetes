@@ -18,6 +18,7 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -27,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -99,7 +100,7 @@ func VerifyLabelsRemoved(c clientset.Interface, nodeName string, labelKeys []str
 	}
 	for _, labelKey := range labelKeys {
 		if node.Labels != nil && len(node.Labels[labelKey]) != 0 {
-			return fmt.Errorf("Failed removing label " + labelKey + " of the node " + nodeName)
+			return errors.New("Failed removing label " + labelKey + " of the node " + nodeName)
 		}
 	}
 	return nil

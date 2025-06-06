@@ -25,12 +25,14 @@ KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 export KUBE_ROOT
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
+kube::golang::setup_env
+
 # Ensure that we find the binaries we build before anything else.
-export GOBIN="${KUBE_OUTPUT_BINPATH}"
+export GOBIN="${KUBE_OUTPUT_BIN}"
 PATH="${GOBIN}:${PATH}"
 
-# Install tools we need, but only from vendor/...
-go install k8s.io/kubernetes/vendor/github.com/client9/misspell/cmd/misspell
+# Install tools we need
+GOTOOLCHAIN="$(kube::golang::hack_tools_gotoolchain)" go -C "${KUBE_ROOT}/hack/tools" install github.com/golangci/misspell/cmd/misspell
 
 # Spell checking
 # All the skipping files are defined in hack/.spelling_failures

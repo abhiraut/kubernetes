@@ -17,14 +17,15 @@ limitations under the License.
 package nodename
 
 import (
-	"context"
-	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 func TestNodeName(t *testing.T) {
@@ -40,29 +41,13 @@ func TestNodeName(t *testing.T) {
 			name: "no host specified",
 		},
 		{
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					NodeName: "foo",
-				},
-			},
-			node: &v1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-			},
+			pod:  st.MakePod().Node("foo").Obj(),
+			node: st.MakeNode().Name("foo").Obj(),
 			name: "host matches",
 		},
 		{
-			pod: &v1.Pod{
-				Spec: v1.PodSpec{
-					NodeName: "bar",
-				},
-			},
-			node: &v1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-			},
+			pod:        st.MakePod().Node("bar").Obj(),
+			node:       st.MakeNode().Name("foo").Obj(),
 			name:       "host doesn't match",
 			wantStatus: framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReason),
 		},
@@ -70,13 +55,16 @@ func TestNodeName(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			nodeInfo := schedulernodeinfo.NewNodeInfo()
+			nodeInfo := framework.NewNodeInfo()
 			nodeInfo.SetNode(test.node)
-
-			p, _ := New(nil, nil)
-			gotStatus := p.(framework.FilterPlugin).Filter(context.Background(), nil, test.pod, nodeInfo)
-			if !reflect.DeepEqual(gotStatus, test.wantStatus) {
-				t.Errorf("status does not match: %v, want: %v", gotStatus, test.wantStatus)
+			_, ctx := ktesting.NewTestContext(t)
+			p, err := New(ctx, nil, nil, feature.Features{})
+			if err != nil {
+				t.Fatalf("creating plugin: %v", err)
+			}
+			gotStatus := p.(framework.FilterPlugin).Filter(ctx, nil, test.pod, nodeInfo)
+			if diff := cmp.Diff(test.wantStatus, gotStatus); diff != "" {
+				t.Errorf("status does not match (-want,+got):\n%s", diff)
 			}
 		})
 	}

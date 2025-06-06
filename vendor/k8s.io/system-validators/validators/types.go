@@ -37,11 +37,13 @@ type KernelConfig struct {
 
 // KernelSpec defines the specification for the kernel. Currently, it contains
 // specification for:
-//   * Kernel Version
-//   * Kernel Configuration
+//   - Kernel Version
+//   - Kernel Configuration
 type KernelSpec struct {
 	// Versions define supported kernel version. It is a group of regexps.
 	Versions []string `json:"versions,omitempty"`
+	// VersionsNote provides additional information if Versions do not match.
+	VersionsNote string `json:"versionsNote,omitempty"`
 	// Required contains all kernel configurations required to be enabled
 	// (built in or as module).
 	Required []KernelConfig `json:"required,omitempty"`
@@ -112,8 +114,16 @@ type SysSpec struct {
 	OS string `json:"os,omitempty"`
 	// KernelConfig defines the spec for kernel.
 	KernelSpec KernelSpec `json:"kernelSpec,omitempty"`
+
 	// Cgroups is the required cgroups.
 	Cgroups []string `json:"cgroups,omitempty"`
+	// CgroupsOptional is the optional cgroups.
+	CgroupsOptional []string `json:"cgroupsOptional,omitempty"`
+	// CgroupsV2 is the required cgroups v2.
+	CgroupsV2 []string `json:"cgroupsV2,omitempty"`
+	// CgroupsV2Optional is the optional cgroups v2.
+	CgroupsV2Optional []string `json:"cgroupsV2Optional,omitempty"`
+
 	// RuntimeSpec defines the spec for runtime.
 	RuntimeSpec RuntimeSpec `json:"runtimeSpec,omitempty"`
 	// PackageSpec defines the required packages and their versions.

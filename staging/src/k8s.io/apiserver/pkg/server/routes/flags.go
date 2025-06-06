@@ -19,12 +19,12 @@ package routes
 import (
 	"fmt"
 	"html/template"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"path"
 	"sync"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"k8s.io/apiserver/pkg/server/mux"
 )
@@ -98,7 +98,7 @@ func StringFlagPutHandler(setter StringFlagSetterFunc) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case req.Method == "PUT":
-			body, err := ioutil.ReadAll(req.Body)
+			body, err := io.ReadAll(req.Body)
 			if err != nil {
 				writePlainText(http.StatusBadRequest, "error reading request body: "+err.Error(), w)
 				return

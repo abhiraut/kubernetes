@@ -22,9 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/storage/names"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	"k8s.io/kubernetes/pkg/apis/autoscaling/validation"
+	"k8s.io/kubernetes/pkg/features"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // autoscalerStrategy implements behavior for HorizontalPodAutoscalers
@@ -42,18 +45,47 @@ func (autoscalerStrategy) NamespaceScoped() bool {
 	return true
 }
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (autoscalerStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"autoscaling/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+		"autoscaling/v2": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+		"autoscaling/v2beta1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+		"autoscaling/v2beta2": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
+}
+
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
 func (autoscalerStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	newHPA := obj.(*autoscaling.HorizontalPodAutoscaler)
 
 	// create cannot set status
 	newHPA.Status = autoscaling.HorizontalPodAutoscalerStatus{}
+
+	dropDisabledFields(newHPA, nil)
 }
 
 // Validate validates a new autoscaler.
 func (autoscalerStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	autoscaler := obj.(*autoscaling.HorizontalPodAutoscaler)
-	return validation.ValidateHorizontalPodAutoscaler(autoscaler)
+	opts := validationOptionsForHorizontalPodAutoscaler(autoscaler, nil)
+	return validation.ValidateHorizontalPodAutoscaler(autoscaler, opts)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (autoscalerStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return nil
 }
 
 // Canonicalize normalizes the object after validation.
@@ -71,11 +103,21 @@ func (autoscalerStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 	oldHPA := old.(*autoscaling.HorizontalPodAutoscaler)
 	// Update is not allowed to set status
 	newHPA.Status = oldHPA.Status
+
+	dropDisabledFields(newHPA, oldHPA)
 }
 
 // ValidateUpdate is the default update validation for an end user.
 func (autoscalerStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidateHorizontalPodAutoscalerUpdate(obj.(*autoscaling.HorizontalPodAutoscaler), old.(*autoscaling.HorizontalPodAutoscaler))
+	newHPA := obj.(*autoscaling.HorizontalPodAutoscaler)
+	oldHPA := old.(*autoscaling.HorizontalPodAutoscaler)
+	opts := validationOptionsForHorizontalPodAutoscaler(newHPA, oldHPA)
+	return validation.ValidateHorizontalPodAutoscalerUpdate(newHPA, oldHPA, opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (autoscalerStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
 
 func (autoscalerStrategy) AllowUnconditionalUpdate() bool {
@@ -89,6 +131,27 @@ type autoscalerStatusStrategy struct {
 // StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = autoscalerStatusStrategy{Strategy}
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (autoscalerStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"autoscaling/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+		"autoscaling/v2": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+		"autoscaling/v2beta1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+		"autoscaling/v2beta2": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+
+	return fields
+}
+
 func (autoscalerStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newAutoscaler := obj.(*autoscaling.HorizontalPodAutoscaler)
 	oldAutoscaler := old.(*autoscaling.HorizontalPodAutoscaler)
@@ -98,4 +161,54 @@ func (autoscalerStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 
 func (autoscalerStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateHorizontalPodAutoscalerStatusUpdate(obj.(*autoscaling.HorizontalPodAutoscaler), old.(*autoscaling.HorizontalPodAutoscaler))
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (autoscalerStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+func validationOptionsForHorizontalPodAutoscaler(newHPA, oldHPA *autoscaling.HorizontalPodAutoscaler) validation.HorizontalPodAutoscalerSpecValidationOptions {
+	opts := validation.HorizontalPodAutoscalerSpecValidationOptions{
+		MinReplicasLowerBound: 1,
+	}
+
+	oldHasZeroMinReplicas := oldHPA != nil && (oldHPA.Spec.MinReplicas != nil && *oldHPA.Spec.MinReplicas == 0)
+	if utilfeature.DefaultFeatureGate.Enabled(features.HPAScaleToZero) || oldHasZeroMinReplicas {
+		opts.MinReplicasLowerBound = 0
+	}
+	return opts
+}
+
+// dropDisabledFields will drop any disabled fields that have not previously been
+// set on the old HPA. oldHPA is ignored if nil.
+func dropDisabledFields(newHPA, oldHPA *autoscaling.HorizontalPodAutoscaler) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.HPAConfigurableTolerance) {
+		return
+	}
+	if toleranceInUse(oldHPA) {
+		return
+	}
+	newBehavior := newHPA.Spec.Behavior
+	if newBehavior == nil {
+		return
+	}
+
+	for _, sr := range []*autoscaling.HPAScalingRules{newBehavior.ScaleDown, newBehavior.ScaleUp} {
+		if sr != nil {
+			sr.Tolerance = nil
+		}
+	}
+}
+
+func toleranceInUse(hpa *autoscaling.HorizontalPodAutoscaler) bool {
+	if hpa == nil || hpa.Spec.Behavior == nil {
+		return false
+	}
+	for _, sr := range []*autoscaling.HPAScalingRules{hpa.Spec.Behavior.ScaleDown, hpa.Spec.Behavior.ScaleUp} {
+		if sr != nil && sr.Tolerance != nil {
+			return true
+		}
+	}
+	return false
 }

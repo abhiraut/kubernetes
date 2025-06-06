@@ -18,15 +18,17 @@ package scale
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/wait"
 	scaleclient "k8s.io/client-go/scale"
 )
@@ -37,10 +39,10 @@ type Scaler interface {
 	// retries in the event of resource version mismatch (if retry is not nil),
 	// and optionally waits until the status of the resource matches newSize (if wait is not nil)
 	// TODO: Make the implementation of this watch-based (#56075) once #31345 is fixed.
-	Scale(namespace, name string, newSize uint, preconditions *ScalePrecondition, retry, wait *RetryParams, gvr schema.GroupVersionResource) error
+	Scale(namespace, name string, newSize uint, preconditions *ScalePrecondition, retry, wait *RetryParams, gvr schema.GroupVersionResource, dryRun bool) error
 	// ScaleSimple does a simple one-shot attempt at scaling - not useful on its own, but
 	// a necessary building block for Scale
-	ScaleSimple(namespace, name string, preconditions *ScalePrecondition, newSize uint, gvr schema.GroupVersionResource) (updatedResourceVersion string, err error)
+	ScaleSimple(namespace, name string, preconditions *ScalePrecondition, newSize uint, gvr schema.GroupVersionResource, dryRun bool) (updatedResourceVersion string, err error)
 }
 
 // NewScaler get a scaler for a given resource
@@ -79,14 +81,14 @@ func NewRetryParams(interval, timeout time.Duration) *RetryParams {
 }
 
 // ScaleCondition is a closure around Scale that facilitates retries via util.wait
-func ScaleCondition(r Scaler, precondition *ScalePrecondition, namespace, name string, count uint, updatedResourceVersion *string, gvr schema.GroupVersionResource) wait.ConditionFunc {
-	return func() (bool, error) {
-		rv, err := r.ScaleSimple(namespace, name, precondition, count, gvr)
+func ScaleCondition(r Scaler, precondition *ScalePrecondition, namespace, name string, count uint, updatedResourceVersion *string, gvr schema.GroupVersionResource, dryRun bool) wait.ConditionWithContextFunc {
+	return func(context.Context) (bool, error) {
+		rv, err := r.ScaleSimple(namespace, name, precondition, count, gvr, dryRun)
 		if updatedResourceVersion != nil {
 			*updatedResourceVersion = rv
 		}
 		// Retry only on update conflicts.
-		if errors.IsConflict(err) {
+		if apierrors.IsConflict(err) {
 			return false, nil
 		}
 		if err != nil {
@@ -115,7 +117,7 @@ type genericScaler struct {
 var _ Scaler = &genericScaler{}
 
 // ScaleSimple updates a scale of a given resource. It returns the resourceVersion of the scale if the update was successful.
-func (s *genericScaler) ScaleSimple(namespace, name string, preconditions *ScalePrecondition, newSize uint, gvr schema.GroupVersionResource) (updatedResourceVersion string, err error) {
+func (s *genericScaler) ScaleSimple(namespace, name string, preconditions *ScalePrecondition, newSize uint, gvr schema.GroupVersionResource, dryRun bool) (updatedResourceVersion string, err error) {
 	if preconditions != nil {
 		scale, err := s.scaleNamespacer.Scales(namespace).Get(context.TODO(), gvr.GroupResource(), name, metav1.GetOptions{})
 		if err != nil {
@@ -125,15 +127,37 @@ func (s *genericScaler) ScaleSimple(namespace, name string, preconditions *Scale
 			return "", err
 		}
 		scale.Spec.Replicas = int32(newSize)
-		updatedScale, err := s.scaleNamespacer.Scales(namespace).Update(context.TODO(), gvr.GroupResource(), scale, metav1.UpdateOptions{})
+		updateOptions := metav1.UpdateOptions{}
+		if dryRun {
+			updateOptions.DryRun = []string{metav1.DryRunAll}
+		}
+		updatedScale, err := s.scaleNamespacer.Scales(namespace).Update(context.TODO(), gvr.GroupResource(), scale, updateOptions)
 		if err != nil {
 			return "", err
 		}
 		return updatedScale.ResourceVersion, nil
 	}
 
-	patch := []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, newSize))
-	updatedScale, err := s.scaleNamespacer.Scales(namespace).Patch(context.TODO(), gvr, name, types.MergePatchType, patch, metav1.PatchOptions{})
+	// objectForReplicas is used for encoding scale patch
+	type objectForReplicas struct {
+		Replicas uint `json:"replicas"`
+	}
+	// objectForSpec is used for encoding scale patch
+	type objectForSpec struct {
+		Spec objectForReplicas `json:"spec"`
+	}
+	spec := objectForSpec{
+		Spec: objectForReplicas{Replicas: newSize},
+	}
+	patch, err := json.Marshal(&spec)
+	if err != nil {
+		return "", err
+	}
+	patchOptions := metav1.PatchOptions{}
+	if dryRun {
+		patchOptions.DryRun = []string{metav1.DryRunAll}
+	}
+	updatedScale, err := s.scaleNamespacer.Scales(namespace).Patch(context.TODO(), gvr, name, types.MergePatchType, patch, patchOptions)
 	if err != nil {
 		return "", err
 	}
@@ -142,13 +166,13 @@ func (s *genericScaler) ScaleSimple(namespace, name string, preconditions *Scale
 
 // Scale updates a scale of a given resource to a new size, with optional precondition check (if preconditions is not nil),
 // optional retries (if retry is not nil), and then optionally waits for the status to reach desired count.
-func (s *genericScaler) Scale(namespace, resourceName string, newSize uint, preconditions *ScalePrecondition, retry, waitForReplicas *RetryParams, gvr schema.GroupVersionResource) error {
+func (s *genericScaler) Scale(namespace, resourceName string, newSize uint, preconditions *ScalePrecondition, retry, waitForReplicas *RetryParams, gvr schema.GroupVersionResource, dryRun bool) error {
 	if retry == nil {
 		// make it try only once, immediately
 		retry = &RetryParams{Interval: time.Millisecond, Timeout: time.Millisecond}
 	}
-	cond := ScaleCondition(s, preconditions, namespace, resourceName, newSize, nil, gvr)
-	if err := wait.PollImmediate(retry.Interval, retry.Timeout, cond); err != nil {
+	cond := ScaleCondition(s, preconditions, namespace, resourceName, newSize, nil, gvr, dryRun)
+	if err := wait.PollUntilContextTimeout(context.Background(), retry.Interval, retry.Timeout, true, cond); err != nil {
 		return err
 	}
 	if waitForReplicas != nil {
@@ -159,9 +183,9 @@ func (s *genericScaler) Scale(namespace, resourceName string, newSize uint, prec
 
 // scaleHasDesiredReplicas returns a condition that will be true if and only if the desired replica
 // count for a scale (Spec) equals its updated replicas count (Status)
-func scaleHasDesiredReplicas(sClient scaleclient.ScalesGetter, gr schema.GroupResource, resourceName string, namespace string, desiredReplicas int32) wait.ConditionFunc {
-	return func() (bool, error) {
-		actualScale, err := sClient.Scales(namespace).Get(context.TODO(), gr, resourceName, metav1.GetOptions{})
+func scaleHasDesiredReplicas(sClient scaleclient.ScalesGetter, gr schema.GroupResource, resourceName string, namespace string, desiredReplicas int32) wait.ConditionWithContextFunc {
+	return func(ctx context.Context) (bool, error) {
+		actualScale, err := sClient.Scales(namespace).Get(ctx, gr, resourceName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -180,11 +204,9 @@ func WaitForScaleHasDesiredReplicas(sClient scaleclient.ScalesGetter, gr schema.
 	if waitForReplicas == nil {
 		return fmt.Errorf("waitForReplicas parameter cannot be nil")
 	}
-	err := wait.PollImmediate(
-		waitForReplicas.Interval,
-		waitForReplicas.Timeout,
-		scaleHasDesiredReplicas(sClient, gr, resourceName, namespace, int32(newSize)))
-	if err == wait.ErrWaitTimeout {
+	err := wait.PollUntilContextTimeout(context.Background(), waitForReplicas.Interval, waitForReplicas.Timeout, true, scaleHasDesiredReplicas(sClient, gr, resourceName, namespace, int32(newSize)))
+
+	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("timed out waiting for %q to be synced", resourceName)
 	}
 	return err
